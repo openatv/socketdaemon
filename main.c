@@ -109,20 +109,10 @@ void processMessage(char *inData)
 	}
 	else if (strcmp(command, CMD_SWITCH_CAM) == 0)
 	{
-		char old[100];
-		char new[100];
-
-		tmp = strchr(data, ',');
-		if(tmp)
-		{
-			strncpy(old, data, tmp - data);
-			command[tmp - data] = 0;
-			strcpy(new, tmp + 1);
-			system("/etc/init.d/softcam stop");
-			remove("/etc/init.d/softcam");
-			sprintf(cmd, "ln -s /etc/init.d/softcam.%s /etc/init.d/softcam", new);
-			system(cmd);
-			system("/etc/init.d/softcam start");
-		}
+		system("/etc/init.d/softcam stop");
+		remove("/etc/init.d/softcam");
+		sprintf(cmd, "ln -s /etc/init.d/softcam.%s /etc/init.d/softcam", data);
+		system(cmd);
+		system("/etc/init.d/softcam start");
 	}
 }
