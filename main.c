@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <sys/un.h>
 #include <string.h>
+#include <errno.h>
 
 #define NAME "/tmp/deamon.socket"
 #define CMD_START "START"
@@ -14,14 +15,29 @@
 #define CMD_RESTART "RESTART"
 #define CMD_SWITCH_CAM "SWITCH_CAM"
 
+static int verbose = 0;
+
 void processMessage(char *inData);
 
-int main()
+int main(int argc, char **argv)
 {
 
 	int sock, msgsock, rval;
 	struct sockaddr_un server;
 	char buf[256];
+	int c = 0;
+
+	while ((c = getopt(argc, argv, "v")) != -1)
+	{
+		if (c == 'v')
+			verbose = 1;
+	}
+
+    if (unlink(NAME) == -1 && errno != ENOENT)
+	{
+		perror("delete stream socket");
+		exit(1);
+	}
 
 	sock = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (sock < 0)
@@ -50,11 +66,11 @@ int main()
 				bzero(buf, sizeof(buf));
 				if ((rval = read(msgsock, buf, 256)) < 0)
 					perror("reading stream message");
-				// else if (rval == 0)
-				// printf("Ending connection\n");
-				else
+				else {
+					if(verbose)
+						printf("processMessage -->%s\n", buf);
 					processMessage(buf);
-				// printf("-->%s\n", buf);
+				}
 			} while (rval > 0);
 		close(msgsock);
 	}
@@ -89,30 +105,42 @@ void processMessage(char *inData)
 		data[0] = 0;
 	}
 
-	// printf("Command='%s'\n", command);
+	if(verbose)
+		printf("processMessage Command='%s'\n", command);
 
-	// Dispath out command
-	if (strcmp(command, CMD_RESTART) == 0)
+	if (strcmp(command, CMD_SWITCH_CAM) == 0)
 	{
-		sprintf(cmd, "/etc/init.d/%s restart", data);
-		rc = system(cmd);
-	}
-	else if (strcmp(command, CMD_STOP) == 0)
-	{
-		sprintf(cmd, "/etc/init.d/%s stop", data);
-		rc = system(cmd);
-	}
-	else if (strcmp(command, CMD_START) == 0)
-	{
-		sprintf(cmd, "/etc/init.d/%s start", data);
-		rc = system(cmd);
-	}
-	else if (strcmp(command, CMD_SWITCH_CAM) == 0)
-	{
-		system("/etc/init.d/softcam stop");
-		remove("/etc/init.d/softcam");
+		rc = system("/etc/init.d/softcam stop");
+		if(verbose)
+			printf("Run softcam stop -> RC %d\n", rc);
+		unlink("/etc/init.d/softcam");
 		sprintf(cmd, "ln -s /etc/init.d/softcam.%s /etc/init.d/softcam", data);
-		system(cmd);
-		system("/etc/init.d/softcam start");
+		rc = system(cmd);
+		if(verbose)
+			printf("Run cmd='%s' -> RC %d\n", cmd, rc);
+		rc = system("/etc/init.d/softcam start");
+		if(verbose)
+			printf("Run softcam start -> RC %d\n", rc);
 	}
+	else {
+		if (strcmp(command, CMD_RESTART) == 0)
+		{
+			sprintf(cmd, "/etc/init.d/%s restart", data);
+		}
+		else if (strcmp(command, CMD_STOP) == 0)
+		{
+			sprintf(cmd, "/etc/init.d/%s stop", data);
+		}
+		else if (strcmp(command, CMD_START) == 0)
+		{
+			sprintf(cmd, "/etc/init.d/%s start", data);
+		}
+		else
+			return;
+
+		rc = system(cmd);
+		if(verbose)
+			printf("Run cmd='%s' -> RC %d\n", cmd, rc);
+	}
+
 }
