@@ -14,6 +14,7 @@
 #define CMD_STOP "STOP"
 #define CMD_RESTART "RESTART"
 #define CMD_SWITCH_CAM "SWITCH_CAM"
+#define CMD_SWITCH_CARDSERVER "SWITCH_CARDSERVER"
 
 static int verbose = 0;
 
@@ -121,6 +122,20 @@ void processMessage(char *inData)
 		rc = system("/etc/init.d/softcam start");
 		if(verbose)
 			printf("Run softcam start -> RC %d\n", rc);
+	}
+	else if (strcmp(command, CMD_SWITCH_CARDSERVER) == 0)
+	{
+		rc = system("/etc/init.d/cardsserver stop");
+		if(verbose)
+			printf("Run cardsserver stop -> RC %d\n", rc);
+		unlink("/etc/init.d/cardsserver");
+		sprintf(cmd, "ln -s /etc/init.d/cardsserver.%s /etc/init.d/cardsserver", data);
+		rc = system(cmd);
+		if(verbose)
+			printf("Run cmd='%s' -> RC %d\n", cmd, rc);
+		rc = system("/etc/init.d/cardsserver start");
+		if(verbose)
+			printf("Run cardsserver start -> RC %d\n", rc);
 	}
 	else {
 		if (strcmp(command, CMD_RESTART) == 0)
