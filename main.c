@@ -125,17 +125,17 @@ void processMessage(char *inData)
 	}
 	else if (strcmp(command, CMD_SWITCH_CARDSERVER) == 0)
 	{
-		rc = system("/etc/init.d/cardsserver stop");
+		rc = system("/etc/init.d/cardserver stop");
 		if(verbose)
-			printf("Run cardsserver stop -> RC %d\n", rc);
-		unlink("/etc/init.d/cardsserver");
-		sprintf(cmd, "ln -s /etc/init.d/cardsserver.%s /etc/init.d/cardsserver", data);
+			printf("Run cardserver stop -> RC %d\n", rc);
+		unlink("/etc/init.d/cardserver");
+		sprintf(cmd, "ln -s /etc/init.d/cardserver.%s /etc/init.d/cardserver", data);
 		rc = system(cmd);
 		if(verbose)
 			printf("Run cmd='%s' -> RC %d\n", cmd, rc);
-		rc = system("/etc/init.d/cardsserver start");
+		rc = system("/etc/init.d/cardserver start");
 		if(verbose)
-			printf("Run cardsserver start -> RC %d\n", rc);
+			printf("Run cardserver start -> RC %d\n", rc);
 	}
 	else {
 		if (strcmp(command, CMD_RESTART) == 0)
