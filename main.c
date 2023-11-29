@@ -72,7 +72,7 @@ int main(int argc, char **argv)
 					if (strlen(buf) > 0)
 					{
 						if (verbose)
-							printf("processMessage -->%s\n", buf);
+							printf("processMessage %d --> '%s' \n", strlen(buf), buf);
 						int rc = processMessage(buf);
 						write(msgsock, "DONE", 4);
 					}
@@ -117,6 +117,7 @@ int processMessage(char *inData)
 	if (strcmp(command, CMD_SWITCH_CAM) == 0)
 	{
 		rc = system("/etc/init.d/softcam stop");
+		usleep(500000); // wait 500 ms after stop
 		if (verbose)
 			printf("Run softcam stop -> RC %d\n", rc);
 		unlink("/etc/init.d/softcam");
@@ -131,6 +132,7 @@ int processMessage(char *inData)
 	else if (strcmp(command, CMD_SWITCH_CARDSERVER) == 0)
 	{
 		rc = system("/etc/init.d/cardserver stop");
+		usleep(500000); // wait 500 ms after stop
 		if (verbose)
 			printf("Run cardserver stop -> RC %d\n", rc);
 		unlink("/etc/init.d/cardserver");
