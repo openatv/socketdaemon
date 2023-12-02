@@ -6,10 +6,10 @@ fi
 
 case "$1" in
 	start)
-		start-stop-daemon -S -b -x /usr/bin/socketdaemon
+		start-stop-daemon -S -b -x /usr/bin/socketdaemon -- -v >> /home/root/logs/socketdebug.log 2>&1
 		;;
 	stop)
-		start-stop-daemon -K -x /usr/bin/socketdaemon
+		start-stop-daemon -K -x /usr/bin/socketdaemon -- -v >> /home/root/logs/socketdebug.log 2>&1
 		;;
 	restart|reload)
 		$0 stop
