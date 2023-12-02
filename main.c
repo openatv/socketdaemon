@@ -21,39 +21,37 @@
 static int verbose = 0;
 
 int processMessage(char *inData);
-/*
-#define eDEBUG_BUFLEN    1024
 
-int formatTime(char *buf, int bufferSize)
+static FILE *log_stream;
+
+
+void LOG(const char *format, ...)
 {
-	int pos = 0;
-	struct timespec tp;
-	struct tm loctime;
-	struct timeval tim;
+	char buf[2048];
+	char timebuf[50];
+	va_list other_args;
+	time_t t;
+	struct tm *tm;
+	va_start(other_args, format);
+	vsnprintf(buf, sizeof(buf), format, other_args);
+	va_end(other_args);
 
-	gettimeofday(&tim, NULL);
-	localtime_r(&tim.tv_sec, &loctime);
-	pos += snprintf(buf + pos, bufferSize - pos, "%04d-%02d-%02d ", 
-		loctime.tm_year + 1900, loctime.tm_mon + 1, loctime.tm_mday);
-	pos += snprintf(buf + pos, bufferSize - pos, "%02d:%02d:%02d.%04lu ", 
-		loctime.tm_hour, loctime.tm_min, loctime.tm_sec, tim.tv_usec / 100L);
-	return pos;
+	time(&t);
+	tm = gmtime(&t);
+
+	if (tm)
+	{
+		strftime(timebuf, sizeof(timebuf), "%Y-%m-%dT%H:%M:%SZ", tm);
+		fprintf(log_stream, "[%s] %s", timebuf, buf);
+	}
+	else
+	{
+		fprintf(log_stream, "%s", buf);
+	}
+	fflush(log_stream);
 }
 
 
-void Debug(const char* fmt, ...)
-{
-
-	char buf[eDEBUG_BUFLEN];
-	int pos = formatTime(buf, eDEBUG_BUFLEN);
-
-	va_list ap;
-	va_start(ap, fmt);
-	int vsize = vsnprintf(buf + pos, eDEBUG_BUFLEN - pos, fmt, ap);
-	va_end(ap);
-	printf(buf);
-}
-*/
 int main(int argc, char **argv)
 {
 
@@ -61,6 +59,8 @@ int main(int argc, char **argv)
 	struct sockaddr_un server;
 	char buf[256];
 	int c = 0;
+
+	log_stream = stdout;
 
 	while ((c = getopt(argc, argv, "v")) != -1)
 	{
@@ -88,9 +88,9 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
-	printf("Start\n");
+	LOG("Start\n");
 
-	//	printf("Socket has name %s\n", server.sun_path);
+	//	LOG("Socket has name %s\n", server.sun_path);
 	listen(sock, 5);
 	for (;;)
 	{
@@ -108,7 +108,7 @@ int main(int argc, char **argv)
 					if (strlen(buf) > 0)
 					{
 						if (verbose)
-							printf("processMessage %d --> '%s' \n", strlen(buf), buf);
+							LOG("processMessage %d --> '%s' \n", strlen(buf), buf);
 						int rc = processMessage(buf);
 						write(msgsock, "DONE", 4);
 					}
@@ -119,7 +119,7 @@ int main(int argc, char **argv)
 	close(sock);
 	unlink(NAME);
 
-	printf("END");
+	LOG("END");
 
 	return EXIT_SUCCESS;
 }
@@ -150,37 +150,37 @@ int processMessage(char *inData)
 	}
 
 	if (verbose)
-		printf("processMessage Command='%s'\n", command);
+		LOG("processMessage Command='%s'\n", command);
 
 	if (strcmp(command, CMD_SWITCH_CAM) == 0)
 	{
 		rc = system("/etc/init.d/softcam stop");
 		usleep(500000); // wait 500 ms after stop
 		if (verbose)
-			printf("Run softcam stop -> RC %d\n", rc);
+			LOG("Run softcam stop -> RC %d\n", rc);
 		unlink("/etc/init.d/softcam");
 		sprintf(cmd, "ln -s /etc/init.d/softcam.%s /etc/init.d/softcam", data);
 		rc = system(cmd);
 		if (verbose)
-			printf("Run cmd='%s' -> RC %d\n", cmd, rc);
+			LOG("Run cmd='%s' -> RC %d\n", cmd, rc);
 		rc = system("/etc/init.d/softcam start");
 		if (verbose)
-			printf("Run softcam start -> RC %d\n", rc);
+			LOG("Run softcam start -> RC %d\n", rc);
 	}
 	else if (strcmp(command, CMD_SWITCH_CARDSERVER) == 0)
 	{
 		rc = system("/etc/init.d/cardserver stop");
 		usleep(500000); // wait 500 ms after stop
 		if (verbose)
-			printf("Run cardserver stop -> RC %d\n", rc);
+			LOG("Run cardserver stop -> RC %d\n", rc);
 		unlink("/etc/init.d/cardserver");
 		sprintf(cmd, "ln -s /etc/init.d/cardserver.%s /etc/init.d/cardserver", data);
 		rc = system(cmd);
 		if (verbose)
-			printf("Run cmd='%s' -> RC %d\n", cmd, rc);
+			LOG("Run cmd='%s' -> RC %d\n", cmd, rc);
 		rc = system("/etc/init.d/cardserver start");
 		if (verbose)
-			printf("Run cardserver start -> RC %d\n", rc);
+			LOG("Run cardserver start -> RC %d\n", rc);
 	}
 	else
 	{
@@ -201,7 +201,7 @@ int processMessage(char *inData)
 
 		rc = system(cmd);
 		if (verbose)
-			printf("Run cmd='%s' -> RC %d\n", cmd, rc);
+			LOG("Run cmd='%s' -> RC %d\n", cmd, rc);
 	}
 	return rc;
 }
