@@ -8,6 +8,8 @@
 #include <sys/un.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
+#include <stdarg.h>
 
 #define NAME "/tmp/deamon.socket"
 #define CMD_START "START"
@@ -19,6 +21,38 @@
 static int verbose = 0;
 
 int processMessage(char *inData);
+
+#define eDEBUG_BUFLEN    1024
+
+int formatTime(char *buf, int bufferSize)
+{
+	int pos = 0;
+	struct timespec tp;
+	struct tm loctime;
+	struct timeval tim;
+
+	gettimeofday(&tim, NULL);
+	localtime_r(&tim.tv_sec, &loctime);
+	pos += snprintf(buf + pos, bufferSize - pos, "%04d-%02d-%02d ", 
+		loctime.tm_year + 1900, loctime.tm_mon + 1, loctime.tm_mday);
+	pos += snprintf(buf + pos, bufferSize - pos, "%02d:%02d:%02d.%04lu ", 
+		loctime.tm_hour, loctime.tm_min, loctime.tm_sec, tim.tv_usec / 100L);
+	return pos;
+}
+
+
+void Debug(const char* fmt, ...)
+{
+
+	char buf[eDEBUG_BUFLEN];
+	int pos = formatTime(buf, eDEBUG_BUFLEN);
+
+	va_list ap;
+	va_start(ap, fmt);
+	int vsize = vsnprintf(buf + pos, eDEBUG_BUFLEN - pos, fmt, ap);
+	va_end(ap);
+	printf(buf);
+}
 
 int main(int argc, char **argv)
 {
@@ -54,6 +88,8 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
+	Debug("Start\n");
+
 	//	printf("Socket has name %s\n", server.sun_path);
 	listen(sock, 5);
 	for (;;)
@@ -72,7 +108,7 @@ int main(int argc, char **argv)
 					if (strlen(buf) > 0)
 					{
 						if (verbose)
-							printf("processMessage %d --> '%s' \n", strlen(buf), buf);
+							Debug("processMessage %d --> '%s' \n", strlen(buf), buf);
 						int rc = processMessage(buf);
 						write(msgsock, "DONE", 4);
 					}
@@ -82,6 +118,8 @@ int main(int argc, char **argv)
 	}
 	close(sock);
 	unlink(NAME);
+
+	Debug("END");
 
 	return EXIT_SUCCESS;
 }
@@ -112,37 +150,37 @@ int processMessage(char *inData)
 	}
 
 	if (verbose)
-		printf("processMessage Command='%s'\n", command);
+		Debug("processMessage Command='%s'\n", command);
 
 	if (strcmp(command, CMD_SWITCH_CAM) == 0)
 	{
 		rc = system("/etc/init.d/softcam stop");
 		usleep(500000); // wait 500 ms after stop
 		if (verbose)
-			printf("Run softcam stop -> RC %d\n", rc);
+			Debug("Run softcam stop -> RC %d\n", rc);
 		unlink("/etc/init.d/softcam");
 		sprintf(cmd, "ln -s /etc/init.d/softcam.%s /etc/init.d/softcam", data);
 		rc = system(cmd);
 		if (verbose)
-			printf("Run cmd='%s' -> RC %d\n", cmd, rc);
+			Debug("Run cmd='%s' -> RC %d\n", cmd, rc);
 		rc = system("/etc/init.d/softcam start");
 		if (verbose)
-			printf("Run softcam start -> RC %d\n", rc);
+			Debug("Run softcam start -> RC %d\n", rc);
 	}
 	else if (strcmp(command, CMD_SWITCH_CARDSERVER) == 0)
 	{
 		rc = system("/etc/init.d/cardserver stop");
 		usleep(500000); // wait 500 ms after stop
 		if (verbose)
-			printf("Run cardserver stop -> RC %d\n", rc);
+			Debug("Run cardserver stop -> RC %d\n", rc);
 		unlink("/etc/init.d/cardserver");
 		sprintf(cmd, "ln -s /etc/init.d/cardserver.%s /etc/init.d/cardserver", data);
 		rc = system(cmd);
 		if (verbose)
-			printf("Run cmd='%s' -> RC %d\n", cmd, rc);
+			Debug("Run cmd='%s' -> RC %d\n", cmd, rc);
 		rc = system("/etc/init.d/cardserver start");
 		if (verbose)
-			printf("Run cardserver start -> RC %d\n", rc);
+			Debug("Run cardserver start -> RC %d\n", rc);
 	}
 	else
 	{
@@ -163,7 +201,7 @@ int processMessage(char *inData)
 
 		rc = system(cmd);
 		if (verbose)
-			printf("Run cmd='%s' -> RC %d\n", cmd, rc);
+			Debug("Run cmd='%s' -> RC %d\n", cmd, rc);
 	}
 	return rc;
 }
