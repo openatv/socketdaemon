@@ -21,7 +21,7 @@
 static int verbose = 0;
 
 int processMessage(char *inData);
-
+/*
 #define eDEBUG_BUFLEN    1024
 
 int formatTime(char *buf, int bufferSize)
@@ -53,7 +53,7 @@ void Debug(const char* fmt, ...)
 	va_end(ap);
 	printf(buf);
 }
-
+*/
 int main(int argc, char **argv)
 {
 
@@ -88,7 +88,7 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
-	Debug("Start\n");
+	printf("Start\n");
 
 	//	printf("Socket has name %s\n", server.sun_path);
 	listen(sock, 5);
@@ -108,7 +108,7 @@ int main(int argc, char **argv)
 					if (strlen(buf) > 0)
 					{
 						if (verbose)
-							Debug("processMessage %d --> '%s' \n", strlen(buf), buf);
+							printf("processMessage %d --> '%s' \n", strlen(buf), buf);
 						int rc = processMessage(buf);
 						write(msgsock, "DONE", 4);
 					}
@@ -119,7 +119,7 @@ int main(int argc, char **argv)
 	close(sock);
 	unlink(NAME);
 
-	Debug("END");
+	printf("END");
 
 	return EXIT_SUCCESS;
 }
@@ -150,37 +150,37 @@ int processMessage(char *inData)
 	}
 
 	if (verbose)
-		Debug("processMessage Command='%s'\n", command);
+		printf("processMessage Command='%s'\n", command);
 
 	if (strcmp(command, CMD_SWITCH_CAM) == 0)
 	{
 		rc = system("/etc/init.d/softcam stop");
 		usleep(500000); // wait 500 ms after stop
 		if (verbose)
-			Debug("Run softcam stop -> RC %d\n", rc);
+			printf("Run softcam stop -> RC %d\n", rc);
 		unlink("/etc/init.d/softcam");
 		sprintf(cmd, "ln -s /etc/init.d/softcam.%s /etc/init.d/softcam", data);
 		rc = system(cmd);
 		if (verbose)
-			Debug("Run cmd='%s' -> RC %d\n", cmd, rc);
+			printf("Run cmd='%s' -> RC %d\n", cmd, rc);
 		rc = system("/etc/init.d/softcam start");
 		if (verbose)
-			Debug("Run softcam start -> RC %d\n", rc);
+			printf("Run softcam start -> RC %d\n", rc);
 	}
 	else if (strcmp(command, CMD_SWITCH_CARDSERVER) == 0)
 	{
 		rc = system("/etc/init.d/cardserver stop");
 		usleep(500000); // wait 500 ms after stop
 		if (verbose)
-			Debug("Run cardserver stop -> RC %d\n", rc);
+			printf("Run cardserver stop -> RC %d\n", rc);
 		unlink("/etc/init.d/cardserver");
 		sprintf(cmd, "ln -s /etc/init.d/cardserver.%s /etc/init.d/cardserver", data);
 		rc = system(cmd);
 		if (verbose)
-			Debug("Run cmd='%s' -> RC %d\n", cmd, rc);
+			printf("Run cmd='%s' -> RC %d\n", cmd, rc);
 		rc = system("/etc/init.d/cardserver start");
 		if (verbose)
-			Debug("Run cardserver start -> RC %d\n", rc);
+			printf("Run cardserver start -> RC %d\n", rc);
 	}
 	else
 	{
@@ -201,7 +201,7 @@ int processMessage(char *inData)
 
 		rc = system(cmd);
 		if (verbose)
-			Debug("Run cmd='%s' -> RC %d\n", cmd, rc);
+			printf("Run cmd='%s' -> RC %d\n", cmd, rc);
 	}
 	return rc;
 }
