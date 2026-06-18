@@ -1,29 +1,59 @@
+/*
+ * socketdaemon/main.c
+ *
+ * Unix Domain Socket daemon for Enigma2 / OpenATV.
+ * Listens on /var/run/daemon.socket (AF_UNIX SOCK_STREAM).
+ *
+ * Protocol (null-terminated strings):
+ *   Client sends:  "<COMMAND>[,<data>]\0"
+ *   Daemon replies: "DONE\0"
+ *
+ * Supported commands:
+ *   RESTART,<service>         → /etc/init.d/<service> restart
+ *   START,<service>           → /etc/init.d/<service> start
+ *   STOP,<service>            → /etc/init.d/<service> stop
+ *   SWITCH_SOFTCAM,<name>     → stop + re-link + start softcam
+ *   SWITCH_CARDSERVER,<name>  → stop + re-link + start cardserver
+ *   NETRESTART                → netrestarter restart all
+ *   NETRESTART,<iface>        → netrestarter restart <iface>
+ *                               (iface: eth0, wlan0, wlan1, …)
+ */
+
 #include <sys/types.h>
-#include <stdio.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <arpa/inet.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/un.h>
-#include <string.h>
 #include <errno.h>
 #include <time.h>
 #include <stdarg.h>
+#include <signal.h>
 
-#define NAME "/tmp/deamon.socket"
+#define NAME "/var/run/daemon.socket"
 #define CMD_START "START"
 #define CMD_STOP "STOP"
 #define CMD_RESTART "RESTART"
 #define CMD_SWITCH_CAM "SWITCH_SOFTCAM"
 #define CMD_SWITCH_CARDSERVER "SWITCH_CARDSERVER"
+#define CMD_NETRESTART "NETRESTART"
+#define NETRESTARTER_SH      "/etc/init.d/netrestarter"
 
 static int verbose = 0;
+static volatile sig_atomic_t running = 1;
 
 int processMessage(char *inData);
 
 static FILE *log_stream;
 
+static void handle_signal(int sig)
+{
+	(void)sig;
+	running = 0;
+}
 
 void LOG(const char *format, ...)
 {
@@ -62,6 +92,13 @@ int main(int argc, char **argv)
 
 	log_stream = stdout;
 
+	struct sigaction sa;
+	sa.sa_handler = handle_signal;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0; /* no SA_RESTART: let accept() return EINTR */
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+
 	while ((c = getopt(argc, argv, "v")) != -1)
 	{
 		if (c == 'v')
@@ -81,29 +118,34 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 	server.sun_family = AF_UNIX;
-	strcpy(server.sun_path, NAME);
+	strncpy(server.sun_path, NAME, sizeof(server.sun_path) - 1);
+	server.sun_path[sizeof(server.sun_path) - 1] = '\0';
 	if (bind(sock, (struct sockaddr *)&server, sizeof(struct sockaddr_un)))
 	{
 		perror("binding stream socket");
 		exit(1);
 	}
+	chmod(NAME, 0600);
 
 	LOG("Start\n");
 
-	int val = 1;
-
-	//	LOG("Socket has name %s\n", server.sun_path);
 	listen(sock, 5);
-	for (;;)
+	while (running)
 	{
 		msgsock = accept(sock, 0, 0);
 		if (msgsock == -1)
+		{
+			if (errno == EINTR)
+				break;
 			perror("accept");
+		}
 		else
+		{
 			do
 			{
-				bzero(buf, sizeof(buf));
-				if ((rval = read(msgsock, buf, 256)) < 0) {
+				memset(buf, 0, sizeof(buf));
+				if ((rval = read(msgsock, buf, sizeof(buf) - 1)) < 0)
+				{
 					perror("reading stream message");
 				}
 				else
@@ -111,21 +153,22 @@ int main(int argc, char **argv)
 					if (strlen(buf) > 0)
 					{
 						if (verbose)
-							LOG("processMessage %d --> '%s' \n", strlen(buf), buf);
+							LOG("processMessage %zu --> '%s' \n", strlen(buf), buf);
 						int rc = processMessage(buf);
 
-						size_t wr = send(msgsock, "DONE", 4, MSG_NOSIGNAL);
+						ssize_t wr = send(msgsock, "DONE", 4, MSG_NOSIGNAL);
 						if (verbose)
-							LOG("write DONE --> %d\n", wr);
+							LOG("write DONE --> %zd rc=%d\n", wr, rc);
 					}
 				}
 			} while (rval > 0);
-		close(msgsock);
+			close(msgsock);
+		}
 	}
 	close(sock);
 	unlink(NAME);
 
-	LOG("END");
+	LOG("END\n");
 
 	return EXIT_SUCCESS;
 }
@@ -133,81 +176,101 @@ int main(int argc, char **argv)
 int processMessage(char *inData)
 {
 	char *tmp;
-	char command[20];
+	char command[32];
 	char data[256];
-	char buff[256];
-	char cmd[100];
+	char cmd[512];
 	int rc;
-
-	buff[0] = 0;
 
 	tmp = strchr(inData, ',');
 
 	if (tmp)
 	{
-		strncpy(command, inData, tmp - inData);
-		command[tmp - inData] = 0;
-		strcpy(data, tmp + 1);
+		size_t clen = (size_t)(tmp - inData);
+		if (clen >= sizeof(command))
+			return -1;
+		strncpy(command, inData, clen);
+		command[clen] = '\0';
+		strncpy(data, tmp + 1, sizeof(data) - 1);
+		data[sizeof(data) - 1] = '\0';
 	}
 	else
 	{
-		strcpy(command, inData);
-		data[0] = 0;
+		strncpy(command, inData, sizeof(command) - 1);
+		command[sizeof(command) - 1] = '\0';
+		data[0] = '\0';
 	}
 
+	/* Strip trailing newlines from command and data */
+	size_t clen = strlen(command);
+	while (clen > 0 && command[clen - 1] == '\n')
+		command[--clen] = '\0';
+
+	size_t dlen = strlen(data);
+	while (dlen > 0 && data[dlen - 1] == '\n')
+		data[--dlen] = '\0';
+
 	if (verbose)
-		LOG("processMessage Command='%s'\n", command);
+		LOG("processMessage Command='%s' Data='%s'\n", command, data);
 
 	if (strcmp(command, CMD_SWITCH_CAM) == 0)
 	{
 		rc = system("/etc/init.d/softcam stop");
-		usleep(500000); // wait 500 ms after stop
+		usleep(500000);
 		if (verbose)
-			LOG("Run softcam stop -> RC %d\n", rc);
+			LOG("softcam stop -> RC %d\n", rc);
 		unlink("/etc/init.d/softcam");
-		sprintf(cmd, "ln -s /etc/init.d/softcam.%s /etc/init.d/softcam", data);
-		rc = system(cmd);
+		char target[300];
+		snprintf(target, sizeof(target), "/etc/init.d/softcam.%s", data);
+		rc = symlink(target, "/etc/init.d/softcam");
 		if (verbose)
-			LOG("Run cmd='%s' -> RC %d\n", cmd, rc);
+			LOG("symlink softcam.%s -> RC %d\n", data, rc);
 		rc = system("/etc/init.d/softcam start");
 		if (verbose)
-			LOG("Run softcam start -> RC %d\n", rc);
+			LOG("softcam start -> RC %d\n", rc);
 	}
 	else if (strcmp(command, CMD_SWITCH_CARDSERVER) == 0)
 	{
 		rc = system("/etc/init.d/cardserver stop");
-		usleep(500000); // wait 500 ms after stop
+		usleep(500000);
 		if (verbose)
-			LOG("Run cardserver stop -> RC %d\n", rc);
+			LOG("cardserver stop -> RC %d\n", rc);
 		unlink("/etc/init.d/cardserver");
-		sprintf(cmd, "ln -s /etc/init.d/cardserver.%s /etc/init.d/cardserver", data);
-		rc = system(cmd);
+		char target[300];
+		snprintf(target, sizeof(target), "/etc/init.d/cardserver.%s", data);
+		rc = symlink(target, "/etc/init.d/cardserver");
 		if (verbose)
-			LOG("Run cmd='%s' -> RC %d\n", cmd, rc);
+			LOG("symlink cardserver.%s -> RC %d\n", data, rc);
 		rc = system("/etc/init.d/cardserver start");
 		if (verbose)
-			LOG("Run cardserver start -> RC %d\n", rc);
+			LOG("cardserver start -> RC %d\n", rc);
 	}
 	else
 	{
 		if (strcmp(command, CMD_RESTART) == 0)
 		{
-			sprintf(cmd, "/etc/init.d/%s restart", data);
+			snprintf(cmd, sizeof(cmd), "/etc/init.d/%s restart", data);
 		}
 		else if (strcmp(command, CMD_STOP) == 0)
 		{
-			sprintf(cmd, "/etc/init.d/%s stop", data);
+			snprintf(cmd, sizeof(cmd), "/etc/init.d/%s stop", data);
 		}
 		else if (strcmp(command, CMD_START) == 0)
 		{
-			sprintf(cmd, "/etc/init.d/%s start", data);
+			snprintf(cmd, sizeof(cmd), "/etc/init.d/%s start", data);
+		}
+		else if (strcmp(command, CMD_NETRESTART) == 0)
+		{
+			if (strlen(data) > 0)
+				snprintf(cmd, sizeof(cmd), "%s restart %s", NETRESTARTER_SH, data);
+			else
+				snprintf(cmd, sizeof(cmd), "%s restart", NETRESTARTER_SH);
 		}
 		else
 			return -1;
 
 		rc = system(cmd);
 		if (verbose)
-			LOG("Run cmd='%s' -> RC %d\n", cmd, rc);
+			LOG("RC %d\n", rc);
 	}
 	return rc;
 }
