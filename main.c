@@ -317,6 +317,34 @@ static int nm_freq_to_channel(int mhz)
 	return 0;
 }
 
+/* Default gateway for iface from /proc/net/route (default route, RTF_GATEWAY set).
+ * out is set to "" when no default gateway is found. */
+static void nm_get_gateway(const char *iface, char *out, size_t outsz)
+{
+	out[0] = '\0';
+	FILE *f = fopen("/proc/net/route", "r");
+	if (!f) return;
+
+	char line[256];
+	if (!fgets(line, sizeof(line), f)) { fclose(f); return; } /* skip header */
+
+	while (fgets(line, sizeof(line), f)) {
+		char riface[IFNAMSIZ];
+		unsigned int dest, gw, flags;
+		if (sscanf(line, "%15s %X %X %X", riface, &dest, &gw, &flags) < 4)
+			continue;
+		if (strcmp(riface, iface) != 0) continue;
+		if (dest != 0) continue;         /* default route only (0.0.0.0) */
+		if (!(flags & 0x2)) continue;    /* RTF_GATEWAY must be set */
+		/* /proc/net/route on LE stores IPs as little-endian hex;
+		 * reading byte-by-byte gives the correct dotted-quad. */
+		unsigned char *b = (unsigned char *)&gw;
+		snprintf(out, outsz, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+		break;
+	}
+	fclose(f);
+}
+
 /* IPv6 addresses from /proc/net/if_inet6 as a JSON array.
  * out is set to "" when no addresses are found. */
 static void nm_get_ipv6(const char *iface, char *out, size_t outsz)
@@ -528,8 +556,10 @@ static void nm_gather_and_write(void)
 				m[0], m[1], m[2], m[3], m[4], m[5]);
 		}
 
-		/* IPv4 address + prefix */
+		/* IPv4 address + prefix + mask + gateway */
 		ipbuf[0] = '\0';
+		char maskbuf[INET_ADDRSTRLEN] = {};
+		char gwbuf[INET_ADDRSTRLEN] = {};
 		int prefix = -1;
 		memset(&ifr, 0, sizeof(ifr));
 		strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
@@ -540,10 +570,11 @@ static void nm_gather_and_write(void)
 			memset(&ifr, 0, sizeof(ifr));
 			strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
 			if (ioctl(sock, SIOCGIFNETMASK, &ifr) >= 0) {
-				uint32_t m = ntohl(
-					((struct sockaddr_in *)&ifr.ifr_netmask)->sin_addr.s_addr);
-				prefix = __builtin_popcount(m);
+				struct in_addr *nm_addr = &((struct sockaddr_in *)&ifr.ifr_netmask)->sin_addr;
+				inet_ntop(AF_INET, nm_addr, maskbuf, sizeof(maskbuf));
+				prefix = __builtin_popcount(ntohl(nm_addr->s_addr));
 			}
+			nm_get_gateway(iface, gwbuf, sizeof(gwbuf));
 		}
 
 		/* IPv6 addresses */
@@ -581,9 +612,15 @@ static void nm_gather_and_write(void)
 		if (ipbuf[0]) {
 			off += snprintf(buf + off, sizeof(buf) - off,
 				",\n      \"ip4\": \"%s\"", ipbuf);
+			if (maskbuf[0])
+				off += snprintf(buf + off, sizeof(buf) - off,
+					",\n      \"mask\": \"%s\"", maskbuf);
 			if (prefix >= 0)
 				off += snprintf(buf + off, sizeof(buf) - off,
 					",\n      \"prefix4\": %d", prefix);
+			if (gwbuf[0])
+				off += snprintf(buf + off, sizeof(buf) - off,
+					",\n      \"gw\": \"%s\"", gwbuf);
 		}
 		if (ip6buf[0])
 			off += snprintf(buf + off, sizeof(buf) - off,
