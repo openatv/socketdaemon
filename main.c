@@ -198,15 +198,17 @@ static const char *nm_port_str(uint8_t port)
 
 static void nm_get_eth_info(int sock, const char *iface,
                             int *speed, int *duplex,
-                            int *port, int *xcvr, int *autoneg)
+                            int *port, int *xcvr, int *autoneg,
+                            uint32_t *supported)
 {
 	struct ifreq ifr;
 	struct ethtool_cmd ecmd;
-	*speed  = -1;
-	*duplex = -1;
-	*port   = -1;
-	*xcvr   = -1;
-	*autoneg = -1;
+	*speed     = -1;
+	*duplex    = -1;
+	*port      = -1;
+	*xcvr      = -1;
+	*autoneg   = -1;
+	*supported = 0;
 	memset(&ifr,  0, sizeof(ifr));
 	memset(&ecmd, 0, sizeof(ecmd));
 	strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
@@ -214,11 +216,12 @@ static void nm_get_eth_info(int sock, const char *iface,
 	ifr.ifr_data = (void *)&ecmd;
 	if (ioctl(sock, SIOCETHTOOL, &ifr) < 0)
 		return;
-	*speed   = (int)ethtool_cmd_speed(&ecmd);
-	*duplex  = (int)ecmd.duplex;    /* 0=half, 1=full */
-	*port    = (int)ecmd.port;
-	*xcvr    = (int)ecmd.transceiver;
-	*autoneg = (int)ecmd.autoneg;   /* 0=off, 1=on */
+	*speed     = (int)ethtool_cmd_speed(&ecmd);
+	*duplex    = (int)ecmd.duplex;      /* 0=half, 1=full */
+	*port      = (int)ecmd.port;
+	*xcvr      = (int)ecmd.transceiver;
+	*autoneg   = (int)ecmd.autoneg;     /* 0=off, 1=on */
+	*supported = ecmd.supported;        /* SUPPORTED_* bitmask */
 }
 
 static void nm_get_wlan_ssid(int sock, const char *iface, char *out, size_t outsz)
@@ -670,7 +673,8 @@ static void nm_gather_and_write(void)
 		} else {
 			int link = nm_get_link(sock, iface);
 			int speed = -1, duplex = -1, port = -1, xcvr = -1, autoneg = -1;
-			nm_get_eth_info(sock, iface, &speed, &duplex, &port, &xcvr, &autoneg);
+			uint32_t supported = 0;
+			nm_get_eth_info(sock, iface, &speed, &duplex, &port, &xcvr, &autoneg, &supported);
 
 			off += snprintf(buf + off, sizeof(buf) - off,
 				",\n      \"link\": %s", link > 0 ? "true" : "false");
@@ -697,11 +701,14 @@ static void nm_gather_and_write(void)
 			if (wol)
 				off += snprintf(buf + off, sizeof(buf) - off,
 					",\n      \"wol_supported\": %u", wol);
+			if (supported)
+				off += snprintf(buf + off, sizeof(buf) - off,
+					",\n      \"link_supported\": %u", supported);
 			if (verbose)
-				LOG("netmon:   lan  link=%d speed=%d duplex=%s port=%s xcvr=%d autoneg=%d wol=0x%x\n",
+				LOG("netmon:   lan  link=%d speed=%d duplex=%s port=%s xcvr=%d autoneg=%d wol=0x%x supported=0x%x\n",
 					link, speed,
 					duplex == 1 ? "full" : duplex == 0 ? "half" : "?",
-					port_s ? port_s : "?", xcvr, autoneg, wol);
+					port_s ? port_s : "?", xcvr, autoneg, wol, supported);
 		}
 
 		if (driverbuf[0])
