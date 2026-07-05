@@ -350,6 +350,19 @@ static void nm_get_gateway(const char *iface, char *out, size_t outsz)
 
 /* IPv6 addresses from /proc/net/if_inet6 as a JSON array.
  * out is set to "" when no addresses are found. */
+/* IPv6 scope byte from /proc/net/if_inet6 -> human label, matches ifconfig's "Scope:" */
+static const char *nm_ipv6_scope_str(int scope)
+{
+	switch (scope) {
+	case 0x00: return "global";
+	case 0x10: return "host";
+	case 0x20: return "link";
+	case 0x40: return "site";
+	case 0x80: return "compat";
+	default:   return "other";
+	}
+}
+
 static void nm_get_ipv6(const char *iface, char *out, size_t outsz)
 {
 	out[0] = '\0';
@@ -368,7 +381,6 @@ static void nm_get_ipv6(const char *iface, char *out, size_t outsz)
 		           hex, &idx, &plen, &scope, &flags, name) != 6)
 			continue;
 		if (strcmp(name, iface) != 0) continue;
-		if (scope != 0x00) continue; /* global only */
 
 		struct in6_addr a;
 		for (int i = 0; i < 16; i++) {
@@ -379,8 +391,8 @@ static void nm_get_ipv6(const char *iface, char *out, size_t outsz)
 		inet_ntop(AF_INET6, &a, astr, sizeof(astr));
 
 		int n = snprintf(out + off, outsz - off,
-		                 "%s{\"addr\":\"%s\",\"prefix\":%d}",
-		                 count ? "," : "", astr, plen);
+		                 "%s{\"addr\":\"%s\",\"prefix\":%d,\"scope\":\"%s\"}",
+		                 count ? "," : "", astr, plen, nm_ipv6_scope_str(scope));
 		if (n > 0) off += n;
 		count++;
 	}
@@ -584,9 +596,17 @@ static void nm_gather_and_write(void)
 				m[0], m[1], m[2], m[3], m[4], m[5]);
 		}
 
-		/* IPv4 address + prefix + mask + gateway */
+		/* MTU */
+		int mtu = -1;
+		memset(&ifr, 0, sizeof(ifr));
+		strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+		if (ioctl(sock, SIOCGIFMTU, &ifr) >= 0)
+			mtu = ifr.ifr_mtu;
+
+		/* IPv4 address + prefix + mask + broadcast + gateway */
 		ipbuf[0] = '\0';
 		char maskbuf[INET_ADDRSTRLEN] = {};
+		char brdbuf[INET_ADDRSTRLEN] = {};
 		char gwbuf[INET_ADDRSTRLEN] = {};
 		int prefix = -1;
 		memset(&ifr, 0, sizeof(ifr));
@@ -601,6 +621,13 @@ static void nm_gather_and_write(void)
 				struct in_addr *nm_addr = &((struct sockaddr_in *)&ifr.ifr_netmask)->sin_addr;
 				inet_ntop(AF_INET, nm_addr, maskbuf, sizeof(maskbuf));
 				prefix = __builtin_popcount(ntohl(nm_addr->s_addr));
+			}
+			memset(&ifr, 0, sizeof(ifr));
+			strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+			if (ioctl(sock, SIOCGIFBRDADDR, &ifr) >= 0) {
+				inet_ntop(AF_INET,
+					&((struct sockaddr_in *)&ifr.ifr_broadaddr)->sin_addr,
+					brdbuf, sizeof(brdbuf));
 			}
 			nm_get_gateway(iface, gwbuf, sizeof(gwbuf));
 		}
@@ -643,6 +670,10 @@ static void nm_gather_and_write(void)
 			rxBytes,
 			txBytes);
 
+		if (mtu >= 0)
+			off += snprintf(buf + off, sizeof(buf) - off,
+				",\n      \"mtu\": %d", mtu);
+
 		if (ipbuf[0]) {
 			off += snprintf(buf + off, sizeof(buf) - off,
 				",\n      \"ip4\": \"%s\"", ipbuf);
@@ -652,6 +683,9 @@ static void nm_gather_and_write(void)
 			if (prefix >= 0)
 				off += snprintf(buf + off, sizeof(buf) - off,
 					",\n      \"prefix4\": %d", prefix);
+			if (brdbuf[0])
+				off += snprintf(buf + off, sizeof(buf) - off,
+					",\n      \"brd\": \"%s\"", brdbuf);
 			if (gwbuf[0])
 				off += snprintf(buf + off, sizeof(buf) - off,
 					",\n      \"gw\": \"%s\"", gwbuf);
