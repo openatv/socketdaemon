@@ -484,6 +484,26 @@ static void nm_get_hw_id(const char *iface, char *buf, size_t bufsz)
 		snprintf(buf, bufsz, "%s:%s", vendor, device);
 }
 
+/* Physical bus the device hangs off ("usb", "pci", "platform", "sdio", ...)
+ * from /sys/class/net/<iface>/device/subsystem symlink target. */
+static void nm_get_bus(const char *iface, char *buf, size_t bufsz)
+{
+	char path[256];
+	char link[256];
+	ssize_t n;
+	const char *slash;
+
+	buf[0] = '\0';
+	snprintf(path, sizeof(path), "/sys/class/net/%s/device/subsystem", iface);
+	n = readlink(path, link, sizeof(link) - 1);
+	if (n <= 0)
+		return;
+	link[n] = '\0';
+	slash = strrchr(link, '/');
+	strncpy(buf, slash ? slash + 1 : link, bufsz - 1);
+	buf[bufsz - 1] = '\0';
+}
+
 static void nm_gather_and_write(void)
 {
 	static char buf[NETMON_BUF_SIZE];
@@ -498,6 +518,7 @@ static void nm_gather_and_write(void)
 	char ssid[NM_IW_ESSID_MAX + 1];
 	char driverbuf[64];
 	char hwidbuf[32];
+	char busbuf[16];
 	struct ifreq ifr;
 	char line[256];
 	int first = 1;
@@ -537,6 +558,10 @@ static void nm_gather_and_write(void)
 		char *iface = line;
 		while (*iface == ' ' || *iface == '\t') iface++;
 		if (strcmp(iface, "lo") == 0) continue;
+
+		/* /proc/net/dev counters: rx_bytes is field 1, tx_bytes is field 9 */
+		unsigned long long rxBytes = 0, txBytes = 0;
+		sscanf(colon + 1, "%llu %*u %*u %*u %*u %*u %*u %*u %llu", &rxBytes, &txBytes);
 
 		int wireless = nm_is_wireless(sock, iface);
 
@@ -584,17 +609,19 @@ static void nm_gather_and_write(void)
 		char ip6buf[512] = {};
 		nm_get_ipv6(iface, ip6buf, sizeof(ip6buf));
 
-		/* driver module name + hardware ID (PCI or USB) */
+		/* driver module name + hardware ID (PCI or USB) + bus */
 		nm_get_driver(iface, driverbuf, sizeof(driverbuf));
 		nm_get_hw_id(iface, hwidbuf, sizeof(hwidbuf));
+		nm_get_bus(iface, busbuf, sizeof(busbuf));
 
 		if (verbose)
-			LOG("netmon: iface=%s type=%s up=%d running=%d mac=%s ip=%s/%d driver=%s hw=%s\n",
+			LOG("netmon: iface=%s type=%s up=%d running=%d mac=%s ip=%s/%d driver=%s hw=%s bus=%s\n",
 				iface, wireless ? "wlan" : "lan",
 				if_up, if_running, macbuf,
 				ipbuf[0] ? ipbuf : "-", prefix,
 				driverbuf[0] ? driverbuf : "-",
-				hwidbuf[0]   ? hwidbuf   : "-");
+				hwidbuf[0]   ? hwidbuf   : "-",
+				busbuf[0]    ? busbuf    : "-");
 
 		if (!first)
 			off += snprintf(buf + off, sizeof(buf) - off, ",\n");
@@ -605,12 +632,16 @@ static void nm_gather_and_write(void)
 			"      \"type\": \"%s\",\n"
 			"      \"up\": %s,\n"
 			"      \"running\": %s,\n"
-			"      \"mac\": \"%s\"",
+			"      \"mac\": \"%s\",\n"
+			"      \"rx_bytes\": %llu,\n"
+			"      \"tx_bytes\": %llu",
 			iface,
 			wireless ? "wlan" : "lan",
 			if_up      ? "true" : "false",
 			if_running ? "true" : "false",
-			macbuf);
+			macbuf,
+			rxBytes,
+			txBytes);
 
 		if (ipbuf[0]) {
 			off += snprintf(buf + off, sizeof(buf) - off,
@@ -717,6 +748,9 @@ static void nm_gather_and_write(void)
 		if (hwidbuf[0])
 			off += snprintf(buf + off, sizeof(buf) - off,
 				",\n      \"hw_id\": \"%s\"", hwidbuf);
+		if (busbuf[0])
+			off += snprintf(buf + off, sizeof(buf) - off,
+				",\n      \"bus\": \"%s\"", busbuf);
 
 		off += snprintf(buf + off, sizeof(buf) - off, "\n    }");
 	}
