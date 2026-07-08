@@ -516,9 +516,52 @@ static void nm_get_bus(const char *iface, char *buf, size_t bufsz)
 	buf[bufsz - 1] = '\0';
 }
 
-static void nm_gather_and_write(void)
+/* Lines carrying these keys change on every scan (byte counters, timestamp)
+ * and must not affect change detection, or every poll would look "changed". */
+static int nm_line_is_volatile(const char *line, size_t len)
+{
+	static const char *const keys[] = { "\"rx_bytes\"", "\"tx_bytes\"", "\"updated\"" };
+	for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+		size_t klen = strlen(keys[k]);
+		for (size_t i = 0; i + klen <= len; i++) {
+			if (memcmp(line + i, keys[k], klen) == 0)
+				return 1;
+		}
+	}
+	return 0;
+}
+
+/* djb2 hash over buf, skipping volatile lines, to detect real state changes
+ * across polls without being tripped up by ever-changing traffic counters. */
+static unsigned long nm_content_hash(const char *s)
+{
+	unsigned long hash = 5381;
+	const char *p = s;
+	while (*p) {
+		const char *nl = strchr(p, '\n');
+		size_t len = nl ? (size_t)(nl - p) : strlen(p);
+		if (!nm_line_is_volatile(p, len)) {
+			hash = hash * 33 + len;
+			for (size_t i = 0; i < len; i++)
+				hash = hash * 33 + (unsigned char)p[i];
+		}
+		if (!nl)
+			break;
+		p = nl + 1;
+	}
+	return hash;
+}
+
+/* Returns 1 if the gathered state differs from the previous scan (ignoring
+ * byte counters / timestamp), 0 otherwise. /var/run/netinfo is refreshed
+ * either way so counters stay current for anyone reading the file directly.
+ * Pass force=1 to always report "changed" (e.g. on client connect or a real
+ * netlink/uevent event), bypassing the hash comparison. */
+static int nm_gather_and_write(int force)
 {
 	static char buf[NETMON_BUF_SIZE];
+	static unsigned long lastHash;
+	static int haveHash;
 	int off = 0;
 	FILE *pf, *out;
 	int sock;
@@ -545,19 +588,19 @@ static void nm_gather_and_write(void)
 	sock = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sock < 0) {
 		LOG("netmon: socket: %s\n", strerror(errno));
-		return;
+		return 0;
 	}
 
 	pf = fopen("/proc/net/dev", "r");
 	if (!pf) {
 		LOG("netmon: cannot open /proc/net/dev: %s\n", strerror(errno));
 		close(sock);
-		return;
+		return 0;
 	}
 
 	/* skip two header lines */
 	if (!fgets(line, sizeof(line), pf) || !fgets(line, sizeof(line), pf)) {
-		fclose(pf); close(sock); return;
+		fclose(pf); close(sock); return 0;
 	}
 
 	off += snprintf(buf + off, sizeof(buf) - off,
@@ -803,6 +846,12 @@ static void nm_gather_and_write(void)
 	} else {
 		LOG("netmon: cannot write %s: %s\n", NETINFO_TMP, strerror(errno));
 	}
+
+	unsigned long hash = nm_content_hash(buf);
+	int changed = force || !haveHash || hash != lastHash;
+	lastHash = hash;
+	haveHash = 1;
+	return changed;
 }
 
 /* ============================================================
@@ -880,9 +929,17 @@ static int nm_handle_rtnetlink(int nls, char *evtbuf, int evtmax)
 				if (verbose) LOG("netmon: RTM_DELLINK %s\n", ifname);
 				off = nm_evt(evtbuf, off, evtmax, "IFACE_REMOVE,%s\n", ifname);
 			} else {
-				int up = (ifi->ifi_flags & IFF_RUNNING) != 0;
-				if (verbose) LOG("netmon: RTM_NEWLINK %s %s\n", ifname, up ? "up" : "down");
-				off = nm_evt(evtbuf, off, evtmax, "LINK,%s,%s\n", ifname, up ? "up" : "down");
+				/* up: administrative state (ifconfig up/down), matches the
+				 * "up" field in the full JSON scan / adapter.kernelUp.
+				 * running: carrier/association state (cable present resp.
+				 * associated to an AP), matches "running"/adapter.kernelLink.
+				 * These are independent — WLAN stays running=0 until
+				 * associated regardless of admin state. */
+				int up = (ifi->ifi_flags & IFF_UP) != 0;
+				int running = (ifi->ifi_flags & IFF_RUNNING) != 0;
+				if (verbose) LOG("netmon: RTM_NEWLINK %s up=%d running=%d\n", ifname, up, running);
+				off = nm_evt(evtbuf, off, evtmax, "LINK,%s,%s,%s\n", ifname,
+					up ? "up" : "down", running ? "up" : "down");
 				if (up) {
 					int s = socket(AF_INET, SOCK_DGRAM, 0);
 					if (s >= 0) {
@@ -1017,7 +1074,7 @@ static void *monitor_thread(void *arg)
 	/* AF_UNIX SOCK_STREAM push socket for NetworkManager */
 	net_srv = nm_setup_event_server();
 
-	nm_gather_and_write(); /* initial scan */
+	nm_gather_and_write(1); /* initial scan */
 
 	while (running) {
 		fd_set fds;
@@ -1049,7 +1106,8 @@ static void *monitor_thread(void *arg)
 				if (net_cli >= 0) close(net_cli);
 				net_cli = nc;
 				if (verbose) LOG("netmon: client connected\n");
-				/* send current state immediately */
+				/* force a fresh scan and send current state immediately */
+				nm_gather_and_write(1);
 				net_cli = nm_send_to_client(net_cli, "UPDATE\n", 7);
 			}
 		}
@@ -1072,14 +1130,21 @@ static void *monitor_thread(void *arg)
 			evtlen += nm_handle_uevent(uev_sock, evtbuf + evtlen, (int)sizeof(evtbuf) - evtlen);
 
 		if (evtlen > 0) {
-			/* specific events: gather first so /var/run/netinfo is fresh */
-			nm_gather_and_write();
+			/* specific events: gather first so /var/run/netinfo is fresh.
+			 * Also push UPDATE so the client does a full resync — the
+			 * specific event handlers (LINK/IP/...) only touch a few
+			 * fields, not everything nm_gather_and_write() just refreshed. */
+			nm_gather_and_write(1);
 			net_cli = nm_send_to_client(net_cli, evtbuf, evtlen);
+			net_cli = nm_send_to_client(net_cli, "UPDATE\n", 7);
 		} else if (r == 0) {
 			/* fallback poll timeout */
 			if (verbose) LOG("netmon: poll timeout – refreshing\n");
-			nm_gather_and_write();
-			net_cli = nm_send_to_client(net_cli, "UPDATE\n", 7);
+			if (nm_gather_and_write(0)) {
+				net_cli = nm_send_to_client(net_cli, "UPDATE\n", 7);
+			} else if (verbose) {
+				LOG("netmon: poll timeout – no change, skipping notify\n");
+			}
 		}
 	}
 
