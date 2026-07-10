@@ -17,17 +17,23 @@
  *   NETRESTART                → netrestarter restart all
  *   NETRESTART,<iface>        → netrestarter restart <iface>
  *                               (iface: eth0, wlan0, wlan1, …)
+ *   PING,<iface>,<host>       → one ICMP echo bound to <iface>, 2s timeout
+ *                               (exitcode 0 = reply received, 1 = no reply)
+ *   RESOLVE,<host>            → resolve <host> via getaddrinfo (AF_INET)
+ *                               (exitcode 0 = resolved, 1 = failed)
  */
 
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/select.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <sys/ioctl.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <net/if.h>
+#include <netdb.h>
 #include <linux/ethtool.h>
 #include <linux/sockios.h>
 #include <linux/netlink.h>
@@ -61,6 +67,8 @@
 #define CMD_WLANUP "WLANUP"
 #define CMD_WLANDOWN "WLANDOWN"
 #define WLANACTIVATOR_SH "/etc/init.d/wlanactivator"
+#define CMD_PING "PING"
+#define CMD_RESOLVE "RESOLVE"
 
 /* network monitor */
 #define NETINFO_PATH      "/var/run/netinfo"
@@ -1314,6 +1322,120 @@ int main(int argc, char **argv)
 	return EXIT_SUCCESS;
 }
 
+static unsigned short icmpChecksum(const void *buf, int len)
+{
+	const unsigned short *p = buf;
+	unsigned int sum = 0;
+	while (len > 1) {
+		sum += *p++;
+		len -= 2;
+	}
+	if (len == 1)
+		sum += *(const unsigned char *)p;
+	sum = (sum >> 16) + (sum & 0xffff);
+	sum += (sum >> 16);
+	return (unsigned short)~sum;
+}
+
+/* One ICMP echo request bound to iface, waits up to timeoutMs for a matching
+ * reply. Returns 0 if a reply was received, 1 otherwise. host may be a
+ * dotted-quad or a hostname (resolved via getaddrinfo). */
+static int doPing(const char *iface, const char *host, int timeoutMs)
+{
+	struct addrinfo hints, *res = NULL;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_RAW;
+	if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res)
+		return 1;
+	struct sockaddr_in dst = *(struct sockaddr_in *)res->ai_addr;
+	freeaddrinfo(res);
+
+	int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	if (sock < 0)
+		return 1;
+
+	struct ifreq ifr;
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+	if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) < 0) {
+		close(sock);
+		return 1;
+	}
+
+	unsigned short pid = (unsigned short)(getpid() & 0xFFFF);
+	struct __attribute__((packed)) {
+		unsigned char type, code;
+		unsigned short checksum, id, seq;
+		char payload[5];
+	} pkt;
+	pkt.type = 8;
+	pkt.code = 0;
+	pkt.checksum = 0;
+	pkt.id = htons(pid);
+	pkt.seq = htons(1);
+	memcpy(pkt.payload, "e2net", 5);
+	pkt.checksum = icmpChecksum(&pkt, sizeof(pkt));
+
+	dst.sin_port = 0;
+	if (sendto(sock, &pkt, sizeof(pkt), 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+		close(sock);
+		return 1;
+	}
+
+	struct timespec deadline;
+	clock_gettime(CLOCK_MONOTONIC, &deadline);
+	deadline.tv_sec += timeoutMs / 1000;
+	deadline.tv_nsec += (long)(timeoutMs % 1000) * 1000000L;
+	if (deadline.tv_nsec >= 1000000000L) {
+		deadline.tv_sec++;
+		deadline.tv_nsec -= 1000000000L;
+	}
+
+	int result = 1;
+	unsigned char buf[1024];
+	for (;;) {
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		long remainMs = (deadline.tv_sec - now.tv_sec) * 1000 + (deadline.tv_nsec - now.tv_nsec) / 1000000L;
+		if (remainMs <= 0)
+			break;
+		struct timeval tv;
+		tv.tv_sec = remainMs / 1000;
+		tv.tv_usec = (remainMs % 1000) * 1000;
+		setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+		ssize_t n = recv(sock, buf, sizeof(buf), 0);
+		if (n < 20)
+			continue;
+		int ihl = (buf[0] & 0x0F) * 4;
+		if (n < ihl + 8)
+			continue;
+		unsigned char rtype = buf[ihl];
+		unsigned short rid;
+		memcpy(&rid, buf + ihl + 4, 2);
+		rid = ntohs(rid);
+		if (rtype == 0 && rid == pid) {
+			result = 0;
+			break;
+		}
+	}
+	close(sock);
+	return result;
+}
+
+/* Resolve host via getaddrinfo (AF_INET). Returns 0 if resolved, 1 otherwise. */
+static int doResolve(const char *host)
+{
+	struct addrinfo hints, *res = NULL;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+	int rc = getaddrinfo(host, NULL, &hints, &res);
+	if (res)
+		freeaddrinfo(res);
+	return (rc == 0) ? 0 : 1;
+}
+
 int processMessage(char *inData)
 {
 	char *tmp;
@@ -1414,6 +1536,36 @@ int processMessage(char *inData)
 			if (r != 0) rc = r;
 			tok = strtok_r(NULL, ",", &saveptr);
 		}
+	}
+	else if (strcmp(command, CMD_PING) == 0)
+	{
+		char dataCopy[sizeof(data)];
+		strncpy(dataCopy, data, sizeof(dataCopy) - 1);
+		dataCopy[sizeof(dataCopy) - 1] = '\0';
+		char *saveptr = NULL;
+		char *ifacePart = strtok_r(dataCopy, ",", &saveptr);
+		char *hostPart = strtok_r(NULL, ",", &saveptr);
+		if (!ifacePart || !hostPart)
+			return -1;
+		size_t ilen = strlen(ifacePart);
+		if (ilen == 0 || ilen >= IFNAMSIZ)
+			return -1;
+		for (size_t i = 0; i < ilen; i++) {
+			char c = ifacePart[i];
+			if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			      (c >= '0' && c <= '9') || c == '.' || c == '-' ||
+			      c == ':' || c == '_'))
+				return -1;
+		}
+		int ok = (doPing(ifacePart, hostPart, 2000) == 0);
+		if (verbose) LOG("ping %s via %s -> %s\n", hostPart, ifacePart, ok ? "OK" : "FAIL");
+		rc = ok ? 0 : (1 << 8);
+	}
+	else if (strcmp(command, CMD_RESOLVE) == 0)
+	{
+		int ok = (doResolve(data) == 0);
+		if (verbose) LOG("resolve %s -> %s\n", data, ok ? "OK" : "FAIL");
+		rc = ok ? 0 : (1 << 8);
 	}
 	else
 	{
