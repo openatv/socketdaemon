@@ -329,17 +329,8 @@ static int nm_freq_to_channel(int mhz)
 }
 
 /* Default gateway for iface from /proc/net/route (default route, RTF_GATEWAY set).
- *
- * Only one default route is ever "the" active one (lowest metric), even when
- * e.g. both eth0 and wlan0 sit on the same LAN and could equally reach the
- * router. So if iface has no default route of its own, but ownIp/ownMask
- * (its own address, from SIOCGIFADDR/SIOCGIFNETMASK) put another interface's
- * default gateway on the same subnet, report that gateway anyway – it's
- * genuinely reachable from iface too, the kernel just didn't pick this route
- * as the system default.
- *
- * out is set to "" when no gateway can be determined either way. */
-static void nm_get_gateway(const char *iface, struct in_addr ownIp, struct in_addr ownMask, char *out, size_t outsz)
+ * out is set to "" when no default gateway is found. */
+static void nm_get_gateway(const char *iface, char *out, size_t outsz)
 {
 	out[0] = '\0';
 	FILE *f = fopen("/proc/net/route", "r");
@@ -348,44 +339,21 @@ static void nm_get_gateway(const char *iface, struct in_addr ownIp, struct in_ad
 	char line[256];
 	if (!fgets(line, sizeof(line), f)) { fclose(f); return; } /* skip header */
 
-	unsigned int fallbackGw = 0;
-	int haveFallback = 0;
-
 	while (fgets(line, sizeof(line), f)) {
 		char riface[IFNAMSIZ];
 		unsigned int dest, gw, flags;
 		if (sscanf(line, "%15s %X %X %X", riface, &dest, &gw, &flags) < 4)
 			continue;
+		if (strcmp(riface, iface) != 0) continue;
 		if (dest != 0) continue;         /* default route only (0.0.0.0) */
 		if (!(flags & 0x2)) continue;    /* RTF_GATEWAY must be set */
-
-		if (strcmp(riface, iface) == 0) {
-			/* iface's own default route wins outright. /proc/net/route on LE
-			 * stores IPs as little-endian hex; reading byte-by-byte gives the
-			 * correct dotted-quad. */
-			unsigned char *b = (unsigned char *)&gw;
-			snprintf(out, outsz, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
-			fclose(f);
-			return;
-		}
-
-		/* Another interface's default gateway – keep it in case iface turns
-		 * out to have none of its own but shares this one's subnet. gw's raw
-		 * bytes and ownIp.s_addr/ownMask.s_addr's raw bytes use the same
-		 * dotted-quad byte layout (see above), so a plain bitwise AND compares
-		 * correctly regardless of host byte order. */
-		if (!haveFallback && ownMask.s_addr != 0 &&
-		    (gw & ownMask.s_addr) == (ownIp.s_addr & ownMask.s_addr)) {
-			fallbackGw = gw;
-			haveFallback = 1;
-		}
+		/* /proc/net/route on LE stores IPs as little-endian hex;
+		 * reading byte-by-byte gives the correct dotted-quad. */
+		unsigned char *b = (unsigned char *)&gw;
+		snprintf(out, outsz, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+		break;
 	}
 	fclose(f);
-
-	if (haveFallback) {
-		unsigned char *b = (unsigned char *)&fallbackGw;
-		snprintf(out, outsz, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
-	}
 }
 
 /* IPv6 addresses from /proc/net/if_inet6 as a JSON array.
@@ -695,14 +663,13 @@ static int nm_gather_and_write(int force)
 		memset(&ifr, 0, sizeof(ifr));
 		strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
 		if (ioctl(sock, SIOCGIFADDR, &ifr) >= 0) {
-			struct in_addr ownIp = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
-			struct in_addr ownMask = { 0 };
-			inet_ntop(AF_INET, &ownIp, ipbuf, sizeof(ipbuf));
+			inet_ntop(AF_INET,
+				&((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr,
+				ipbuf, sizeof(ipbuf));
 			memset(&ifr, 0, sizeof(ifr));
 			strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
 			if (ioctl(sock, SIOCGIFNETMASK, &ifr) >= 0) {
 				struct in_addr *nm_addr = &((struct sockaddr_in *)&ifr.ifr_netmask)->sin_addr;
-				ownMask = *nm_addr;
 				inet_ntop(AF_INET, nm_addr, maskbuf, sizeof(maskbuf));
 				prefix = __builtin_popcount(ntohl(nm_addr->s_addr));
 			}
@@ -713,7 +680,7 @@ static int nm_gather_and_write(int force)
 					&((struct sockaddr_in *)&ifr.ifr_broadaddr)->sin_addr,
 					brdbuf, sizeof(brdbuf));
 			}
-			nm_get_gateway(iface, ownIp, ownMask, gwbuf, sizeof(gwbuf));
+			nm_get_gateway(iface, gwbuf, sizeof(gwbuf));
 		}
 
 		/* IPv6 addresses */
