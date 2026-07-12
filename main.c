@@ -328,32 +328,120 @@ static int nm_freq_to_channel(int mhz)
 	return 0;
 }
 
-/* Default gateway for iface from /proc/net/route (default route, RTF_GATEWAY set).
- * out is set to "" when no default gateway is found. */
-static void nm_get_gateway(const char *iface, char *out, size_t outsz)
+/* Policy-routing table multihome setups keep per-adapter default routes in
+ * (one entry per adapter, each with its own metric); see nm_scan_default_routes(). */
+#define NM_MULTIHOME_RT_TABLE 201
+#define NM_MAX_DEFAULT_ROUTES 16
+
+struct nm_default_route {
+	unsigned int ifindex;
+	struct in_addr gw;
+	unsigned int metric;
+	int table;
+};
+
+/* Every interface's own default route (gateway + metric), plus which
+ * interface currently owns the system's single active default gateway,
+ * found via one NETLINK_ROUTE RTM_GETROUTE dump.
+ *
+ * Multihome setups keep one default route per interface in
+ * NM_MULTIHOME_RT_TABLE, all of them present at the same time (so switching
+ * is just a metric/ip-rule change) but only the one with the lowest metric
+ * is actually used for outbound traffic. For a given interface, its
+ * NM_MULTIHOME_RT_TABLE entry is authoritative when present; interfaces
+ * without one (single-adapter, non-multihome devices) fall back to whatever
+ * table their default route lives in (normally main). The winner is picked
+ * the same way, but across interfaces: lowest metric among
+ * NM_MULTIHOME_RT_TABLE entries if any exist, else lowest metric overall.
+ *
+ * Fills routes[] (up to max entries, one per interface that has a default
+ * route) and returns the entry count. *out_winner_ifindex is set to the
+ * winning interface's index, or 0 if no default route was found at all. */
+static int nm_scan_default_routes(struct nm_default_route *routes, int max, unsigned int *out_winner_ifindex)
 {
-	out[0] = '\0';
-	FILE *f = fopen("/proc/net/route", "r");
-	if (!f) return;
+	int count = 0;
+	*out_winner_ifindex = 0;
 
-	char line[256];
-	if (!fgets(line, sizeof(line), f)) { fclose(f); return; } /* skip header */
+	int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+	if (sock < 0) return 0;
 
-	while (fgets(line, sizeof(line), f)) {
-		char riface[IFNAMSIZ];
-		unsigned int dest, gw, flags;
-		if (sscanf(line, "%15s %X %X %X", riface, &dest, &gw, &flags) < 4)
-			continue;
-		if (strcmp(riface, iface) != 0) continue;
-		if (dest != 0) continue;         /* default route only (0.0.0.0) */
-		if (!(flags & 0x2)) continue;    /* RTF_GATEWAY must be set */
-		/* /proc/net/route on LE stores IPs as little-endian hex;
-		 * reading byte-by-byte gives the correct dotted-quad. */
-		unsigned char *b = (unsigned char *)&gw;
-		snprintf(out, outsz, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
-		break;
+	struct {
+		struct nlmsghdr nlh;
+		struct rtmsg rtm;
+	} req;
+	memset(&req, 0, sizeof(req));
+	req.nlh.nlmsg_len = sizeof(req);
+	req.nlh.nlmsg_type = RTM_GETROUTE;
+	req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	req.nlh.nlmsg_seq = 1;
+	req.rtm.rtm_family = AF_INET;
+
+	if (send(sock, &req, req.nlh.nlmsg_len, 0) < 0) { close(sock); return 0; }
+
+	int done = 0;
+	char buf[8192];
+
+	while (!done) {
+		ssize_t len = recv(sock, buf, sizeof(buf), 0);
+		if (len <= 0) break;
+
+		struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+		for (; NLMSG_OK(nlh, (size_t)len); nlh = NLMSG_NEXT(nlh, len)) {
+			if (nlh->nlmsg_type == NLMSG_DONE || nlh->nlmsg_type == NLMSG_ERROR) {
+				done = 1;
+				break;
+			}
+			if (nlh->nlmsg_type != RTM_NEWROUTE) continue;
+
+			struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(nlh);
+			if (rtm->rtm_dst_len != 0) continue; /* default route only */
+
+			struct rtattr *rta = RTM_RTA(rtm);
+			int rtl = (int)RTM_PAYLOAD(nlh);
+			unsigned int oif = 0, metric = 0;
+			struct in_addr gw = { 0 };
+			int haveGw = 0;
+
+			for (; RTA_OK(rta, rtl); rta = RTA_NEXT(rta, rtl)) {
+				switch (rta->rta_type) {
+				case RTA_OIF:      oif = *(unsigned int *)RTA_DATA(rta); break;
+				case RTA_GATEWAY:  gw = *(struct in_addr *)RTA_DATA(rta); haveGw = 1; break;
+				case RTA_PRIORITY: metric = *(unsigned int *)RTA_DATA(rta); break;
+				}
+			}
+			if (!haveGw || !oif) continue;
+
+			/* keep, per interface, its NM_MULTIHOME_RT_TABLE entry if there is
+			 * one, else the first entry seen for it */
+			struct nm_default_route *existing = NULL;
+			for (int i = 0; i < count; i++) {
+				if (routes[i].ifindex == oif) { existing = &routes[i]; break; }
+			}
+			if (existing) {
+				if (rtm->rtm_table == NM_MULTIHOME_RT_TABLE)
+					*existing = (struct nm_default_route){ oif, gw, metric, rtm->rtm_table };
+			} else if (count < max) {
+				routes[count++] = (struct nm_default_route){ oif, gw, metric, rtm->rtm_table };
+			}
+		}
 	}
-	fclose(f);
+	close(sock);
+
+	/* winner: lowest metric among NM_MULTIHOME_RT_TABLE entries if any exist,
+	 * else lowest metric overall */
+	int anyMultihome = 0;
+	for (int i = 0; i < count; i++)
+		if (routes[i].table == NM_MULTIHOME_RT_TABLE) { anyMultihome = 1; break; }
+
+	int winner = -1;
+	for (int i = 0; i < count; i++) {
+		if (anyMultihome && routes[i].table != NM_MULTIHOME_RT_TABLE) continue;
+		if (winner < 0 || routes[i].metric < routes[winner].metric)
+			winner = i;
+	}
+	if (winner >= 0) *out_winner_ifindex = routes[winner].ifindex;
+
+	return count;
 }
 
 /* IPv6 addresses from /proc/net/if_inet6 as a JSON array.
@@ -606,6 +694,13 @@ static int nm_gather_and_write(int force)
 		return 0;
 	}
 
+	/* every interface's own default route metric is reported below, but only
+	 * the interface that owns the system's single active default gateway
+	 * gets a "gw" field (see nm_scan_default_routes()) */
+	struct nm_default_route defRoutes[NM_MAX_DEFAULT_ROUTES];
+	unsigned int defGwWinnerIfindex = 0;
+	int defRouteCount = nm_scan_default_routes(defRoutes, NM_MAX_DEFAULT_ROUTES, &defGwWinnerIfindex);
+
 	/* skip two header lines */
 	if (!fgets(line, sizeof(line), pf) || !fgets(line, sizeof(line), pf)) {
 		fclose(pf); close(sock); return 0;
@@ -659,6 +754,8 @@ static int nm_gather_and_write(int force)
 		char maskbuf[INET_ADDRSTRLEN] = {};
 		char brdbuf[INET_ADDRSTRLEN] = {};
 		char gwbuf[INET_ADDRSTRLEN] = {};
+		unsigned int gwMetric = 0;
+		int haveGwMetric = 0;
 		int prefix = -1;
 		memset(&ifr, 0, sizeof(ifr));
 		strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
@@ -680,7 +777,15 @@ static int nm_gather_and_write(int force)
 					&((struct sockaddr_in *)&ifr.ifr_broadaddr)->sin_addr,
 					brdbuf, sizeof(brdbuf));
 			}
-			nm_get_gateway(iface, gwbuf, sizeof(gwbuf));
+			unsigned int ifindex = if_nametoindex(iface);
+			for (int i = 0; i < defRouteCount; i++) {
+				if (defRoutes[i].ifindex != ifindex) continue;
+				gwMetric = defRoutes[i].metric;
+				haveGwMetric = 1;
+				if (ifindex == defGwWinnerIfindex)
+					inet_ntop(AF_INET, &defRoutes[i].gw, gwbuf, sizeof(gwbuf));
+				break;
+			}
 		}
 
 		/* IPv6 addresses */
@@ -740,6 +845,9 @@ static int nm_gather_and_write(int force)
 			if (gwbuf[0])
 				off += snprintf(buf + off, sizeof(buf) - off,
 					",\n      \"gw\": \"%s\"", gwbuf);
+			if (haveGwMetric)
+				off += snprintf(buf + off, sizeof(buf) - off,
+					",\n      \"metric\": %u", gwMetric);
 		}
 		if (ip6buf[0])
 			off += snprintf(buf + off, sizeof(buf) - off,
