@@ -169,6 +169,17 @@ void LOG(const char *format, ...)
  * Network monitor helpers
  * ============================================================ */
 
+/* VPN tunnels (WireGuard, OpenVPN tun/tap, PPP) show up as regular
+ * point-to-point interfaces in /proc/net/dev; tell them apart from
+ * physical links via IFF_POINTOPOINT plus the usual name prefixes. */
+static int nm_is_vpn(short flags, const char *iface)
+{
+	if (flags & IFF_POINTOPOINT)
+		return 1;
+	return !strncmp(iface, "wg", 2) || !strncmp(iface, "tun", 3) ||
+	       !strncmp(iface, "tap", 3) || !strncmp(iface, "ppp", 3);
+}
+
 static int nm_is_wireless(int sock, const char *iface)
 {
 	struct nm_iwreq wrq;
@@ -726,11 +737,13 @@ static int nm_gather_and_write(int force)
 		/* interface flags */
 		memset(&ifr, 0, sizeof(ifr));
 		strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
-		int if_up = 0, if_running = 0;
+		int if_up = 0, if_running = 0, if_flags = 0;
 		if (ioctl(sock, SIOCGIFFLAGS, &ifr) >= 0) {
+			if_flags   = ifr.ifr_flags;
 			if_up      = (ifr.ifr_flags & IFF_UP)      != 0;
 			if_running = (ifr.ifr_flags & IFF_RUNNING) != 0;
 		}
+		int vpn = !wireless && nm_is_vpn((short)if_flags, iface);
 
 		/* MAC */
 		macbuf[0] = '\0';
@@ -797,9 +810,11 @@ static int nm_gather_and_write(int force)
 		nm_get_hw_id(iface, hwidbuf, sizeof(hwidbuf));
 		nm_get_bus(iface, busbuf, sizeof(busbuf));
 
+		const char *iftype = wireless ? "wlan" : (vpn ? "vpn" : "lan");
+
 		if (verbose)
 			LOG("netmon: iface=%s type=%s up=%d running=%d mac=%s ip=%s/%d driver=%s hw=%s bus=%s\n",
-				iface, wireless ? "wlan" : "lan",
+				iface, iftype,
 				if_up, if_running, macbuf,
 				ipbuf[0] ? ipbuf : "-", prefix,
 				driverbuf[0] ? driverbuf : "-",
@@ -819,7 +834,7 @@ static int nm_gather_and_write(int force)
 			"      \"rx_bytes\": %llu,\n"
 			"      \"tx_bytes\": %llu",
 			iface,
-			wireless ? "wlan" : "lan",
+			iftype,
 			if_up      ? "true" : "false",
 			if_running ? "true" : "false",
 			macbuf,
