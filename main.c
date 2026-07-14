@@ -177,7 +177,8 @@ static int nm_is_vpn(short flags, const char *iface)
 	if (flags & IFF_POINTOPOINT)
 		return 1;
 	return !strncmp(iface, "wg", 2) || !strncmp(iface, "tun", 3) ||
-	       !strncmp(iface, "tap", 3) || !strncmp(iface, "ppp", 3);
+	       !strncmp(iface, "tap", 3) || !strncmp(iface, "ppp", 3) ||
+	       !strncmp(iface, "zt", 2);
 }
 
 static int nm_is_wireless(int sock, const char *iface)
