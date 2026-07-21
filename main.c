@@ -123,6 +123,27 @@ union  nm_iwreq_data {
 };
 struct nm_iwreq      { char iw_ifname[IFNAMSIZ]; union nm_iwreq_data u; };
 
+/*
+ * Minimal Generic Netlink / nl80211 definitions – hand-rolled like the
+ * wireless-extension ioctls above, to avoid depending on linux/nl80211.h
+ * and linux/genetlink.h, which aren't guaranteed present/consistent across
+ * the many cross-compilation kernel header sets this daemon is built with.
+ */
+#define NM_NETLINK_GENERIC          16
+#define NM_GENL_ID_CTRL             0x10
+#define NM_CTRL_CMD_GETFAMILY       3
+#define NM_CTRL_ATTR_FAMILY_ID      1
+#define NM_CTRL_ATTR_FAMILY_NAME    2
+#define NM_NL80211_CMD_GET_STATION      17
+#define NM_NL80211_ATTR_IFINDEX         3
+#define NM_NL80211_ATTR_MAC             6
+#define NM_NL80211_ATTR_STA_INFO        21
+#define NM_NL80211_STA_INFO_TX_BITRATE  8
+#define NM_NL80211_RATE_INFO_BITRATE    1
+#define NM_NL80211_RATE_INFO_BITRATE32  5
+
+struct nm_genlmsghdr { uint8_t cmd, version; uint16_t reserved; };
+
 static int verbose = 0;
 static volatile sig_atomic_t running = 1;
 static pthread_t g_monitor_tid;
@@ -325,15 +346,171 @@ static int nm_get_wlan_freq_mhz(int sock, const char *iface)
 	return (int)m;
 }
 
-/* TX bitrate in bps via SIOCGIWRATE; returns 0 when not available */
+/* Appends one netlink attribute (type+len+data, 4-byte aligned) to buf at
+ * off; returns the new offset. Reuses struct rtattr / RTA_* macros from
+ * linux/rtnetlink.h - identical binary layout to generic-netlink's nlattr. */
+static size_t nm_nl_put(void *buf, size_t off, unsigned short type, const void *data, size_t len)
+{
+	struct rtattr *rta = (struct rtattr *)((char *)buf + off);
+	rta->rta_type = type;
+	rta->rta_len  = RTA_LENGTH(len);
+	memcpy(RTA_DATA(rta), data, len);
+	return off + RTA_ALIGN(rta->rta_len);
+}
+
+/* Resolves the nl80211 generic-netlink family id once; cached for the
+ * process lifetime. Returns -1 if generic netlink / nl80211 is unavailable. */
+static int nm_nl80211_family_id(void)
+{
+	static int cached = -2; /* -2 = not yet resolved */
+	if (cached != -2)
+		return cached;
+	cached = -1;
+
+	int sock = socket(AF_NETLINK, SOCK_RAW, NM_NETLINK_GENERIC);
+	if (sock < 0)
+		return cached;
+
+	uint8_t txbuf[64];
+	memset(txbuf, 0, sizeof(txbuf));
+	struct nlmsghdr *nlh = (struct nlmsghdr *)txbuf;
+	struct nm_genlmsghdr *genl = (struct nm_genlmsghdr *)NLMSG_DATA(nlh);
+	genl->cmd = NM_CTRL_CMD_GETFAMILY;
+	size_t off = NLMSG_ALIGN(sizeof(*nlh)) + sizeof(*genl);
+	off = nm_nl_put(txbuf, off, NM_CTRL_ATTR_FAMILY_NAME, "nl80211", 8);
+
+	nlh->nlmsg_len   = (uint32_t)off;
+	nlh->nlmsg_type  = NM_GENL_ID_CTRL;
+	nlh->nlmsg_flags = NLM_F_REQUEST;
+	nlh->nlmsg_seq   = 1;
+
+	if (send(sock, txbuf, off, 0) < 0) {
+		close(sock);
+		return cached;
+	}
+
+	uint8_t rxbuf[256];
+	ssize_t len = recv(sock, rxbuf, sizeof(rxbuf), 0);
+	close(sock);
+	if (len < (ssize_t)sizeof(struct nlmsghdr))
+		return cached;
+
+	struct nlmsghdr *rnlh = (struct nlmsghdr *)rxbuf;
+	if (!NLMSG_OK(rnlh, (size_t)len) || rnlh->nlmsg_type == NLMSG_ERROR)
+		return cached;
+
+	struct rtattr *rta = (struct rtattr *)((char *)NLMSG_DATA(rnlh) + sizeof(struct nm_genlmsghdr));
+	int rtl = (int)(rnlh->nlmsg_len - NLMSG_ALIGN(sizeof(*rnlh)) - sizeof(struct nm_genlmsghdr));
+	for (; RTA_OK(rta, rtl); rta = RTA_NEXT(rta, rtl)) {
+		if (rta->rta_type == NM_CTRL_ATTR_FAMILY_ID) {
+			cached = *(uint16_t *)RTA_DATA(rta);
+			break;
+		}
+	}
+	return cached;
+}
+
+/* Current TX bitrate in bps via nl80211 GET_STATION; returns 0 when
+ * unavailable. Used as a fallback for SIOCGIWRATE (see below), which some
+ * 802.11n USB dongles (e.g. rt2800usb / RT2870-RT3070) get stuck reporting
+ * a stale legacy OFDM floor rate once running at real HT rates. */
+static int nm_get_wlan_bitrate_nl80211(const char *iface, const uint8_t mac[6])
+{
+	int family = nm_nl80211_family_id();
+	if (family < 0)
+		return 0;
+
+	unsigned int ifindex = if_nametoindex(iface);
+	if (!ifindex)
+		return 0;
+
+	int sock = socket(AF_NETLINK, SOCK_RAW, NM_NETLINK_GENERIC);
+	if (sock < 0)
+		return 0;
+
+	uint8_t txbuf[128];
+	memset(txbuf, 0, sizeof(txbuf));
+	struct nlmsghdr *nlh = (struct nlmsghdr *)txbuf;
+	struct nm_genlmsghdr *genl = (struct nm_genlmsghdr *)NLMSG_DATA(nlh);
+	genl->cmd = NM_NL80211_CMD_GET_STATION;
+	size_t off = NLMSG_ALIGN(sizeof(*nlh)) + sizeof(*genl);
+	uint32_t ifidx32 = ifindex;
+	off = nm_nl_put(txbuf, off, NM_NL80211_ATTR_IFINDEX, &ifidx32, sizeof(ifidx32));
+	off = nm_nl_put(txbuf, off, NM_NL80211_ATTR_MAC, mac, 6);
+
+	nlh->nlmsg_len   = (uint32_t)off;
+	nlh->nlmsg_type  = (uint16_t)family;
+	nlh->nlmsg_flags = NLM_F_REQUEST;
+	nlh->nlmsg_seq   = 1;
+
+	if (send(sock, txbuf, off, 0) < 0) {
+		close(sock);
+		return 0;
+	}
+
+	uint8_t rxbuf[2048];
+	ssize_t len = recv(sock, rxbuf, sizeof(rxbuf), 0);
+	close(sock);
+	if (len < (ssize_t)sizeof(struct nlmsghdr))
+		return 0;
+
+	struct nlmsghdr *rnlh = (struct nlmsghdr *)rxbuf;
+	if (!NLMSG_OK(rnlh, (size_t)len) || rnlh->nlmsg_type == NLMSG_ERROR)
+		return 0;
+
+	struct rtattr *rta = (struct rtattr *)((char *)NLMSG_DATA(rnlh) + sizeof(struct nm_genlmsghdr));
+	int rtl = (int)(rnlh->nlmsg_len - NLMSG_ALIGN(sizeof(*rnlh)) - sizeof(struct nm_genlmsghdr));
+	int bps = 0;
+	for (; RTA_OK(rta, rtl); rta = RTA_NEXT(rta, rtl)) {
+		if (rta->rta_type != NM_NL80211_ATTR_STA_INFO)
+			continue;
+		struct rtattr *sinfo = (struct rtattr *)RTA_DATA(rta);
+		int sinfo_len = (int)RTA_PAYLOAD(rta);
+		for (; RTA_OK(sinfo, sinfo_len); sinfo = RTA_NEXT(sinfo, sinfo_len)) {
+			if (sinfo->rta_type != NM_NL80211_STA_INFO_TX_BITRATE)
+				continue;
+			struct rtattr *rinfo = (struct rtattr *)RTA_DATA(sinfo);
+			int rinfo_len = (int)RTA_PAYLOAD(sinfo);
+			for (; RTA_OK(rinfo, rinfo_len); rinfo = RTA_NEXT(rinfo, rinfo_len)) {
+				/* both units are 100 kbit/s */
+				if (rinfo->rta_type == NM_NL80211_RATE_INFO_BITRATE32)
+					bps = (int)(*(uint32_t *)RTA_DATA(rinfo) * 100000u);
+				else if (rinfo->rta_type == NM_NL80211_RATE_INFO_BITRATE && bps == 0)
+					bps = (int)(*(uint16_t *)RTA_DATA(rinfo) * 100000u);
+			}
+		}
+	}
+	return bps;
+}
+
+/* TX bitrate in bps via SIOCGIWRATE; returns 0 when not available.
+ * Falls back to nl80211 GET_STATION when the ioctl value looks like a stale
+ * legacy rate (<=54 Mb/s, the 802.11a/g ceiling) - mac80211's WEXT compat
+ * layer can't represent HT/VHT rates and some drivers just leave the field
+ * at the legacy floor instead of the real link speed (see above). Only used
+ * as a corrective fallback so working adapters are left untouched. */
 static int nm_get_wlan_bitrate(int sock, const char *iface)
 {
 	struct nm_iwreq wrq;
 	memset(&wrq, 0, sizeof(wrq));
 	strncpy(wrq.iw_ifname, iface, IFNAMSIZ - 1);
-	if (ioctl(sock, SIOCGIWRATE, &wrq) < 0)
-		return 0;
-	return wrq.u.param.value > 0 ? (int)wrq.u.param.value : 0;
+	int bps = 0;
+	if (ioctl(sock, SIOCGIWRATE, &wrq) >= 0 && wrq.u.param.value > 0)
+		bps = (int)wrq.u.param.value;
+
+	if (bps <= 54000000) {
+		char bssidbuf[18];
+		if (nm_get_wlan_bssid(sock, iface, bssidbuf, sizeof(bssidbuf))) {
+			uint8_t mac[6];
+			if (sscanf(bssidbuf, "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx",
+			           &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
+				int nl_bps = nm_get_wlan_bitrate_nl80211(iface, mac);
+				if (nl_bps > bps)
+					bps = nl_bps;
+			}
+		}
+	}
+	return bps;
 }
 
 /* Channel number from frequency in MHz */
@@ -634,7 +811,7 @@ static void nm_get_bus(const char *iface, char *buf, size_t bufsz)
  * and must not affect change detection, or every poll would look "changed". */
 static int nm_line_is_volatile(const char *line, size_t len)
 {
-	static const char *const keys[] = { "\"rx_bytes\"", "\"tx_bytes\"", "\"updated\"" };
+	static const char *const keys[] = { "\"rx_bytes\"", "\"tx_bytes\"", "\"updated\"", "\"bitrate_bps\"" };
 	for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
 		size_t klen = strlen(keys[k]);
 		for (size_t i = 0; i + klen <= len; i++) {
