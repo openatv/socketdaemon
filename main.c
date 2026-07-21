@@ -39,6 +39,7 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <linux/if_addr.h>
+#include <linux/neighbour.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -73,6 +74,11 @@
 /* network monitor */
 #define NETINFO_PATH      "/var/run/netinfo"
 #define NETINFO_TMP       "/var/run/netinfo.tmp"
+
+/* Neighbor (ARP/NDP) snapshot */
+#define NETNEIGHBORS_PATH      "/var/run/netneighbors"
+#define NETNEIGHBORS_TMP       "/var/run/netneighbors.tmp"
+#define NM_NEIGH_MAX 128 /* fixed-size known-neighbor table, embedded box - no dynamic growth */
 /* Safety fallback interval – only fires if kernel emits no events (e.g.
  * DHCP renewal on kernel 3.14 does not generate RTMGRP_IPV4_IFADDR).
  * select() is blocking, so this costs zero CPU while waiting. */
@@ -1035,6 +1041,220 @@ static int nm_evt(char *evtbuf, int off, int max, const char *fmt, ...)
 }
 
 /* ============================================================
+ * Neighbor (ARP/NDP) table – Neighbor discovery provider for NetworkMounts.
+ * See NETWORK_BROWSER_PLUGIN_V5.md section 5.3/30.1.6.
+ *
+ * Kernel state machine (linux/neighbour.h NUD_*): only REACHABLE/STALE/
+ * DELAY/PROBE are "this address answered recently" - INCOMPLETE (ARP still
+ * in flight) and FAILED are not useful discovery candidates and are never
+ * reported as ADD/CHANGE. REMOVE is always reported regardless of the last
+ * known state, so a consumer's candidate list stays in sync.
+ * ============================================================ */
+
+static const char *nm_neigh_state_name(int state)
+{
+	switch (state) {
+	case NUD_INCOMPLETE: return "INCOMPLETE";
+	case NUD_REACHABLE:  return "REACHABLE";
+	case NUD_STALE:      return "STALE";
+	case NUD_DELAY:      return "DELAY";
+	case NUD_PROBE:      return "PROBE";
+	case NUD_FAILED:     return "FAILED";
+	case NUD_NOARP:      return "NOARP";
+	case NUD_PERMANENT:  return "PERMANENT";
+	default:             return "NONE";
+	}
+}
+
+static int nm_neigh_state_is_candidate(int state)
+{
+	return state == NUD_REACHABLE || state == NUD_STALE ||
+	       state == NUD_DELAY || state == NUD_PROBE;
+}
+
+/* Fixed-size "have we already told the client about this (ifindex,family,addr)"
+ * table, purely to tell ADD from CHANGE - not a cache of neighbor data itself
+ * (the kernel already has that; /var/run/networkbrowser/state/netneighbors.json
+ * is the authoritative snapshot, see nm_dump_neighbors()). No dynamic growth,
+ * matches this file's general embedded-box style (compare netmount_queue etc.);
+ * once full, oldest-looking entries just don't get deduped perfectly, which
+ * only costs an occasional spurious ADD instead of CHANGE - harmless. */
+typedef struct {
+	int used;
+	int ifindex;
+	unsigned char family;
+	unsigned char addr[16]; /* IPv4 uses first 4 bytes, IPv6 all 16 */
+} nm_neigh_key_t;
+
+static nm_neigh_key_t nm_known_neighbors[NM_NEIGH_MAX];
+
+static int nm_neigh_addrlen(int family)
+{
+	return family == AF_INET6 ? 16 : 4;
+}
+
+static nm_neigh_key_t *nm_neigh_find(int ifindex, int family, const void *addr)
+{
+	int addrlen = nm_neigh_addrlen(family);
+	for (int i = 0; i < NM_NEIGH_MAX; i++) {
+		nm_neigh_key_t *k = &nm_known_neighbors[i];
+		if (k->used && k->ifindex == ifindex && k->family == family &&
+		    memcmp(k->addr, addr, addrlen) == 0)
+			return k;
+	}
+	return NULL;
+}
+
+/* Marks (ifindex,family,addr) known, returns 1 if it already was (→ CHANGE),
+ * 0 if this is the first time we've seen it (→ ADD). */
+static int nm_neigh_mark_known(int ifindex, int family, const void *addr)
+{
+	if (nm_neigh_find(ifindex, family, addr))
+		return 1;
+	for (int i = 0; i < NM_NEIGH_MAX; i++) {
+		if (!nm_known_neighbors[i].used) {
+			nm_known_neighbors[i].used = 1;
+			nm_known_neighbors[i].ifindex = ifindex;
+			nm_known_neighbors[i].family = (unsigned char)family;
+			memcpy(nm_known_neighbors[i].addr, addr, nm_neigh_addrlen(family));
+			return 0;
+		}
+	}
+	/* table full - can't remember this one, treat every future sighting as
+	 * ADD; harmless (see struct comment above) */
+	return 0;
+}
+
+static void nm_neigh_forget(int ifindex, int family, const void *addr)
+{
+	nm_neigh_key_t *k = nm_neigh_find(ifindex, family, addr);
+	if (k) k->used = 0;
+}
+
+/* Extracts NDA_DST/NDA_LLADDR from one RTM_NEWNEIGH/RTM_DELNEIGH message's
+ * attributes. Returns 1 if a usable NDA_DST was found (an entry without one
+ * isn't addressable and is skipped by callers), 0 otherwise. lladdr/lladdrlen
+ * are optional (multicast/broadcast neighbor entries have none). */
+static int nm_neigh_parse_attrs(struct nlmsghdr *nlh, struct ndmsg *ndm,
+	unsigned char *dst, int *dstlen, unsigned char *lladdr, int *lladdrlen)
+{
+	int rtalen = (int)NLMSG_PAYLOAD(nlh, sizeof(*ndm));
+	struct rtattr *rta = (struct rtattr *)((char *)ndm + NLMSG_ALIGN(sizeof(*ndm)));
+	*dstlen = 0;
+	*lladdrlen = 0;
+	for (; RTA_OK(rta, rtalen); rta = RTA_NEXT(rta, rtalen)) {
+		if (rta->rta_type == NDA_DST) {
+			int len = RTA_PAYLOAD(rta);
+			if (len > 16) len = 16;
+			memcpy(dst, RTA_DATA(rta), len);
+			*dstlen = len;
+		} else if (rta->rta_type == NDA_LLADDR) {
+			int len = RTA_PAYLOAD(rta);
+			if (len > 6) len = 6;
+			memcpy(lladdr, RTA_DATA(rta), len);
+			*lladdrlen = len;
+		}
+	}
+	return *dstlen > 0;
+}
+
+/* Full RTM_GETNEIGH dump (same request/response pattern as
+ * nm_scan_default_routes() above, just RTM_GETNEIGH/RTM_NEWNEIGH instead of
+ * RTM_GETROUTE/RTM_NEWROUTE). Writes the authoritative snapshot to
+ * NETNEIGHBORS_PATH and marks every reported candidate-state entry as known,
+ * so the live RTM_NEWNEIGH/DELNEIGH handler in nm_handle_rtnetlink() below
+ * correctly reports CHANGE (not another ADD) for entries already in this
+ * initial dump. Called once at monitor_thread() startup. */
+static void nm_dump_neighbors(void)
+{
+	static char buf[NETMON_BUF_SIZE];
+	int off = 0;
+	int first = 1;
+
+	int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+	if (sock < 0) { LOG("netmon: neigh dump socket: %s\n", strerror(errno)); return; }
+
+	struct {
+		struct nlmsghdr nlh;
+		struct ndmsg ndm;
+	} req;
+	memset(&req, 0, sizeof(req));
+	req.nlh.nlmsg_len = sizeof(req);
+	req.nlh.nlmsg_type = RTM_GETNEIGH;
+	req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	req.nlh.nlmsg_seq = 1;
+	req.ndm.ndm_family = AF_UNSPEC; /* both IPv4 and IPv6 */
+
+	if (send(sock, &req, req.nlh.nlmsg_len, 0) < 0) {
+		LOG("netmon: neigh dump send: %s\n", strerror(errno));
+		close(sock);
+		return;
+	}
+
+	off += snprintf(buf + off, sizeof(buf) - off, "{\n  \"neighbors\": [\n");
+
+	int done = 0;
+	char rbuf[8192];
+	while (!done) {
+		ssize_t len = recv(sock, rbuf, sizeof(rbuf), 0);
+		if (len <= 0) break;
+
+		struct nlmsghdr *nlh = (struct nlmsghdr *)rbuf;
+		for (; NLMSG_OK(nlh, (size_t)len); nlh = NLMSG_NEXT(nlh, len)) {
+			if (nlh->nlmsg_type == NLMSG_DONE || nlh->nlmsg_type == NLMSG_ERROR) {
+				done = 1;
+				break;
+			}
+			if (nlh->nlmsg_type != RTM_NEWNEIGH) continue;
+
+			struct ndmsg *ndm = (struct ndmsg *)NLMSG_DATA(nlh);
+			if (!nm_neigh_state_is_candidate(ndm->ndm_state)) continue;
+
+			char ifname[IFNAMSIZ] = {0};
+			if_indextoname(ndm->ndm_ifindex, ifname);
+			if (!ifname[0] || strcmp(ifname, "lo") == 0) continue;
+
+			unsigned char dst[16], lladdr[6];
+			int dstlen = 0, lladdrlen = 0;
+			if (!nm_neigh_parse_attrs(nlh, ndm, dst, &dstlen, lladdr, &lladdrlen))
+				continue;
+
+			char ipbuf[INET6_ADDRSTRLEN] = {0};
+			inet_ntop(ndm->ndm_family, dst, ipbuf, sizeof(ipbuf));
+			char macbuf[18] = {0};
+			if (lladdrlen == 6)
+				snprintf(macbuf, sizeof(macbuf), "%02x:%02x:%02x:%02x:%02x:%02x",
+					lladdr[0], lladdr[1], lladdr[2], lladdr[3], lladdr[4], lladdr[5]);
+
+			nm_neigh_mark_known(ndm->ndm_ifindex, ndm->ndm_family, dst);
+
+			if (off < (int)sizeof(buf) - 300) {
+				off += snprintf(buf + off, sizeof(buf) - off,
+					"%s    {\"family\": %d, \"address\": \"%s\", \"lladdr\": \"%s\", "
+					"\"ifindex\": %d, \"interface\": \"%s\", \"state\": \"%s\"}",
+					first ? "" : ",\n", ndm->ndm_family == AF_INET6 ? 6 : 4,
+					ipbuf, macbuf, ndm->ndm_ifindex, ifname,
+					nm_neigh_state_name(ndm->ndm_state));
+				first = 0;
+			}
+		}
+	}
+	close(sock);
+
+	off += snprintf(buf + off, sizeof(buf) - off, "\n  ]\n}\n");
+
+	FILE *out = fopen(NETNEIGHBORS_TMP, "w");
+	if (out) {
+		fputs(buf, out);
+		fclose(out);
+		rename(NETNEIGHBORS_TMP, NETNEIGHBORS_PATH);
+		if (verbose) LOG("netmon: wrote %s (%d bytes)\n", NETNEIGHBORS_PATH, off);
+	} else {
+		LOG("netmon: cannot write %s: %s\n", NETNEIGHBORS_TMP, strerror(errno));
+	}
+}
+
+/* ============================================================
  * NETLINK_ROUTE parser → structured event lines
  * ============================================================ */
 
@@ -1104,6 +1324,49 @@ static int nm_handle_rtnetlink(int nls, char *evtbuf, int evtmax)
 				ifname, ipbuf, ifa->ifa_prefixlen);
 			off = nm_evt(evtbuf, off, evtmax, "IP,%s,%s/%d\n",
 				ifname, ipbuf, ifa->ifa_prefixlen);
+		}
+		else if (nlh->nlmsg_type == RTM_NEWNEIGH || nlh->nlmsg_type == RTM_DELNEIGH) {
+			struct ndmsg *ndm = (struct ndmsg *)NLMSG_DATA(nlh);
+			if (ndm->ndm_family != AF_INET && ndm->ndm_family != AF_INET6) continue;
+
+			char ifname[IFNAMSIZ] = {0};
+			if_indextoname(ndm->ndm_ifindex, ifname);
+			if (!ifname[0] || strcmp(ifname, "lo") == 0) continue;
+
+			unsigned char dst[16], lladdr[6];
+			int dstlen = 0, lladdrlen = 0;
+			if (!nm_neigh_parse_attrs(nlh, ndm, dst, &dstlen, lladdr, &lladdrlen))
+				continue; /* no NDA_DST, nothing addressable to report */
+
+			int isDel = (nlh->nlmsg_type == RTM_DELNEIGH);
+			if (!isDel && !nm_neigh_state_is_candidate(ndm->ndm_state)) {
+				/* INCOMPLETE/FAILED etc. - not yet/no longer a useful
+				 * candidate, don't report and don't mark known so a later
+				 * transition into a candidate state still reports ADD */
+				continue;
+			}
+
+			char ipbuf[INET6_ADDRSTRLEN] = {0};
+			inet_ntop(ndm->ndm_family, dst, ipbuf, sizeof(ipbuf));
+			char macbuf[18] = {0};
+			if (lladdrlen == 6)
+				snprintf(macbuf, sizeof(macbuf), "%02x:%02x:%02x:%02x:%02x:%02x",
+					lladdr[0], lladdr[1], lladdr[2], lladdr[3], lladdr[4], lladdr[5]);
+
+			const char *action;
+			if (isDel) {
+				action = "REMOVE";
+				nm_neigh_forget(ndm->ndm_ifindex, ndm->ndm_family, dst);
+			} else {
+				action = nm_neigh_mark_known(ndm->ndm_ifindex, ndm->ndm_family, dst)
+					? "CHANGE" : "ADD";
+			}
+
+			if (verbose) LOG("netmon: NEIGH %s %s %s on %s state=%s\n",
+				action, ipbuf, macbuf, ifname, nm_neigh_state_name(ndm->ndm_state));
+			off = nm_evt(evtbuf, off, evtmax, "NEIGH,%s,%d,%d,%s,%s,%s,%s\n",
+				action, ndm->ndm_family == AF_INET6 ? 6 : 4, ndm->ndm_ifindex,
+				ifname, ipbuf, macbuf, nm_neigh_state_name(ndm->ndm_state));
 		}
 	}
 	return off;
@@ -1183,7 +1446,7 @@ static void *monitor_thread(void *arg)
 	if (nls < 0) { LOG("netmon: netlink socket: %s\n", strerror(errno)); goto out; }
 	memset(&sa, 0, sizeof(sa));
 	sa.nl_family = AF_NETLINK;
-	sa.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
+	sa.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR | RTMGRP_NEIGH;
 	if (bind(nls, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
 		LOG("netmon: netlink bind: %s\n", strerror(errno)); goto out;
 	}
@@ -1207,6 +1470,7 @@ static void *monitor_thread(void *arg)
 	net_srv = nm_setup_event_server();
 
 	nm_gather_and_write(1); /* initial scan */
+	nm_dump_neighbors(); /* initial neighbor snapshot, see section 5.3/30.1.6 */
 
 	while (running) {
 		fd_set fds;
