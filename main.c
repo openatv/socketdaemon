@@ -2159,8 +2159,7 @@ int processMessage(char *inData)
 			else
 				snprintf(cmd, sizeof(cmd), "%s restart", NETRESTARTER_SH);
 		}
-		else if (strcmp(command, CMD_IFUP) == 0 ||
-		         strcmp(command, CMD_WLANUP) == 0 || strcmp(command, CMD_WLANDOWN) == 0)
+		else if (strcmp(command, CMD_IFUP) == 0 || strcmp(command, CMD_WLANDOWN) == 0)
 		{
 			/* single interface only */
 			size_t ilen = strlen(data);
@@ -2175,10 +2174,46 @@ int processMessage(char *inData)
 			}
 			if (strcmp(command, CMD_IFUP) == 0)
 				snprintf(cmd, sizeof(cmd), "/sbin/ifup %s", data);
-			else if (strcmp(command, CMD_WLANUP) == 0)
-				snprintf(cmd, sizeof(cmd), "%s start %s", WLANACTIVATOR_SH, data);
 			else
 				snprintf(cmd, sizeof(cmd), "%s stop %s", WLANACTIVATOR_SH, data);
+		}
+		else if (strcmp(command, CMD_WLANUP) == 0)
+		{
+			/* data = "<iface>[,<networkId>]" - networkId pins wpa_supplicant to
+			 * exactly that one saved network (wpa_cli select_network in
+			 * wlanactivator) instead of letting it auto-pick/roam among every
+			 * enabled network in wpa_supplicant.conf. */
+			char dataCopy[sizeof(data)];
+			strncpy(dataCopy, data, sizeof(dataCopy) - 1);
+			dataCopy[sizeof(dataCopy) - 1] = '\0';
+			char *saveptr = NULL;
+			char *ifacePart = strtok_r(dataCopy, ",", &saveptr);
+			char *netIdPart = strtok_r(NULL, ",", &saveptr);
+			if (!ifacePart)
+				return -1;
+			size_t ilen = strlen(ifacePart);
+			if (ilen == 0 || ilen >= IFNAMSIZ)
+				return -1;
+			for (size_t i = 0; i < ilen; i++) {
+				char c = ifacePart[i];
+				if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+				      (c >= '0' && c <= '9') || c == '.' || c == '-' ||
+				      c == ':' || c == '_'))
+					return -1;
+			}
+			if (netIdPart)
+			{
+				size_t nlen = strlen(netIdPart);
+				if (nlen == 0 || nlen >= 16)
+					return -1;
+				for (size_t i = 0; i < nlen; i++) {
+					if (netIdPart[i] < '0' || netIdPart[i] > '9')
+						return -1;
+				}
+				snprintf(cmd, sizeof(cmd), "%s start %s %s", WLANACTIVATOR_SH, ifacePart, netIdPart);
+			}
+			else
+				snprintf(cmd, sizeof(cmd), "%s start %s", WLANACTIVATOR_SH, ifacePart);
 		}
 		else
 			return -1;
