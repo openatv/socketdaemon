@@ -2099,6 +2099,12 @@ int processMessage(char *inData)
 			int r = system(cmd);
 			if (verbose) LOG("ifdown %s -> RC %d\n", tok, r);
 			if (r != 0) rc = r;
+			/* ifdown doesn't reliably remove leftover addresses (e.g. a stale
+			 * DHCP lease) on every setup - flush explicitly so a down interface
+			 * never keeps reporting an address to netifaces/ifaddresses(). */
+			snprintf(cmd, sizeof(cmd), "/sbin/ip addr flush dev %s 2>/dev/null", tok);
+			int rf = system(cmd);
+			if (verbose) LOG("ip addr flush dev %s -> RC %d\n", tok, rf);
 			tok = strtok_r(NULL, ",", &saveptr);
 		}
 	}
