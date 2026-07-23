@@ -389,7 +389,11 @@ static int nm_nl80211_family_id(void)
 		return cached;
 	}
 
-	uint8_t rxbuf[256];
+	/* nl80211's CTRL_ATTR_OPS list alone runs into several KB on modern
+	 * kernels; a too-small buffer here silently truncates the reply and
+	 * makes NLMSG_OK() reject it (nlmsg_len then exceeds the bytes we
+	 * actually received), so family resolution always failed. */
+	uint8_t rxbuf[8192];
 	ssize_t len = recv(sock, rxbuf, sizeof(rxbuf), 0);
 	close(sock);
 	if (len < (ssize_t)sizeof(struct nlmsghdr))
@@ -484,11 +488,12 @@ static int nm_get_wlan_bitrate_nl80211(const char *iface, const uint8_t mac[6])
 }
 
 /* TX bitrate in bps via SIOCGIWRATE; returns 0 when not available.
- * Falls back to nl80211 GET_STATION when the ioctl value looks like a stale
- * legacy rate (<=54 Mb/s, the 802.11a/g ceiling) - mac80211's WEXT compat
- * layer can't represent HT/VHT rates and some drivers just leave the field
- * at the legacy floor instead of the real link speed (see above). Only used
- * as a corrective fallback so working adapters are left untouched. */
+ * Corrected with nl80211 GET_STATION when that reports a higher rate -
+ * mac80211's WEXT compat layer can't represent HT/VHT rates and some
+ * drivers just leave the field at a legacy floor instead of the real link
+ * speed (see above), and that wrong value isn't reliably bounded by the
+ * 802.11a/g 54 Mb/s ceiling on every driver, so nl80211 is always consulted
+ * rather than only below some ioctl-value threshold. */
 static int nm_get_wlan_bitrate(int sock, const char *iface)
 {
 	struct nm_iwreq wrq;
@@ -498,16 +503,14 @@ static int nm_get_wlan_bitrate(int sock, const char *iface)
 	if (ioctl(sock, SIOCGIWRATE, &wrq) >= 0 && wrq.u.param.value > 0)
 		bps = (int)wrq.u.param.value;
 
-	if (bps <= 54000000) {
-		char bssidbuf[18];
-		if (nm_get_wlan_bssid(sock, iface, bssidbuf, sizeof(bssidbuf))) {
-			uint8_t mac[6];
-			if (sscanf(bssidbuf, "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx",
-			           &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
-				int nl_bps = nm_get_wlan_bitrate_nl80211(iface, mac);
-				if (nl_bps > bps)
-					bps = nl_bps;
-			}
+	char bssidbuf[18];
+	if (nm_get_wlan_bssid(sock, iface, bssidbuf, sizeof(bssidbuf))) {
+		uint8_t mac[6];
+		if (sscanf(bssidbuf, "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx",
+		           &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
+			int nl_bps = nm_get_wlan_bitrate_nl80211(iface, mac);
+			if (nl_bps > bps)
+				bps = nl_bps;
 		}
 	}
 	return bps;
@@ -1250,17 +1253,21 @@ static int nm_neigh_state_is_candidate(int state)
 }
 
 /* Fixed-size "have we already told the client about this (ifindex,family,addr)"
- * table, purely to tell ADD from CHANGE - not a cache of neighbor data itself
- * (the kernel already has that; /var/run/networkbrowser/state/netneighbors.json
- * is the authoritative snapshot, see nm_dump_neighbors()). No dynamic growth,
- * matches this file's general embedded-box style (compare netmount_queue etc.);
- * once full, oldest-looking entries just don't get deduped perfectly, which
- * only costs an occasional spurious ADD instead of CHANGE - harmless. */
+ * table, plus the lladdr last reported for it - just enough to tell ADD from
+ * a no-op NUD state re-affirmation from an actual MAC change; not a full
+ * cache of neighbor data (the kernel already has that;
+ * /var/run/networkbrowser/state/netneighbors.json is the authoritative
+ * snapshot, see nm_dump_neighbors()). No dynamic growth, matches this file's
+ * general embedded-box style (compare netmount_queue etc.); once full,
+ * oldest-looking entries just don't get deduped perfectly, which only costs
+ * an occasional spurious ADD instead of CHANGE - harmless. */
 typedef struct {
 	int used;
 	int ifindex;
 	unsigned char family;
 	unsigned char addr[16]; /* IPv4 uses first 4 bytes, IPv6 all 16 */
+	unsigned char lladdr[6];
+	unsigned char lladdrlen;
 } nm_neigh_key_t;
 
 static nm_neigh_key_t nm_known_neighbors[NM_NEIGH_MAX];
@@ -1282,24 +1289,42 @@ static nm_neigh_key_t *nm_neigh_find(int ifindex, int family, const void *addr)
 	return NULL;
 }
 
-/* Marks (ifindex,family,addr) known, returns 1 if it already was (→ CHANGE),
- * 0 if this is the first time we've seen it (→ ADD). */
-static int nm_neigh_mark_known(int ifindex, int family, const void *addr)
+/* Marks (ifindex,family,addr) known and records its current lladdr.
+ * Returns NM_NEIGH_ADDED (first time seen), NM_NEIGH_UNCHANGED (already
+ * known, lladdr identical - pure NUD state churn like REACHABLE->STALE with
+ * no new information), or NM_NEIGH_MAC_CHANGED (already known, lladdr
+ * differs from what we last recorded - a real change worth reporting). */
+enum { NM_NEIGH_ADDED, NM_NEIGH_UNCHANGED, NM_NEIGH_MAC_CHANGED };
+
+static int nm_neigh_mark_known(int ifindex, int family, const void *addr,
+	const unsigned char *lladdr, int lladdrlen)
 {
-	if (nm_neigh_find(ifindex, family, addr))
-		return 1;
+	nm_neigh_key_t *k = nm_neigh_find(ifindex, family, addr);
+	if (k) {
+		int changed = lladdrlen > 0 &&
+			(k->lladdrlen != lladdrlen || memcmp(k->lladdr, lladdr, lladdrlen) != 0);
+		if (lladdrlen > 0) {
+			memcpy(k->lladdr, lladdr, lladdrlen);
+			k->lladdrlen = (unsigned char)lladdrlen;
+		}
+		return changed ? NM_NEIGH_MAC_CHANGED : NM_NEIGH_UNCHANGED;
+	}
 	for (int i = 0; i < NM_NEIGH_MAX; i++) {
 		if (!nm_known_neighbors[i].used) {
 			nm_known_neighbors[i].used = 1;
 			nm_known_neighbors[i].ifindex = ifindex;
 			nm_known_neighbors[i].family = (unsigned char)family;
 			memcpy(nm_known_neighbors[i].addr, addr, nm_neigh_addrlen(family));
-			return 0;
+			if (lladdrlen > 0) {
+				memcpy(nm_known_neighbors[i].lladdr, lladdr, lladdrlen);
+				nm_known_neighbors[i].lladdrlen = (unsigned char)lladdrlen;
+			}
+			return NM_NEIGH_ADDED;
 		}
 	}
 	/* table full - can't remember this one, treat every future sighting as
 	 * ADD; harmless (see struct comment above) */
-	return 0;
+	return NM_NEIGH_ADDED;
 }
 
 static void nm_neigh_forget(int ifindex, int family, const void *addr)
@@ -1403,7 +1428,7 @@ static void nm_dump_neighbors(void)
 				snprintf(macbuf, sizeof(macbuf), "%02x:%02x:%02x:%02x:%02x:%02x",
 					lladdr[0], lladdr[1], lladdr[2], lladdr[3], lladdr[4], lladdr[5]);
 
-			nm_neigh_mark_known(ndm->ndm_ifindex, ndm->ndm_family, dst);
+			nm_neigh_mark_known(ndm->ndm_ifindex, ndm->ndm_family, dst, lladdr, lladdrlen);
 
 			if (off < (int)sizeof(buf) - 300) {
 				off += snprintf(buf + off, sizeof(buf) - off,
@@ -1523,21 +1548,27 @@ static int nm_handle_rtnetlink(int nls, char *evtbuf, int evtmax)
 				continue;
 			}
 
+			const char *action;
+			if (isDel) {
+				action = "REMOVE";
+				nm_neigh_forget(ndm->ndm_ifindex, ndm->ndm_family, dst);
+			} else {
+				int r = nm_neigh_mark_known(ndm->ndm_ifindex, ndm->ndm_family, dst,
+					lladdr, lladdrlen);
+				if (r == NM_NEIGH_UNCHANGED)
+					/* pure NUD aging (REACHABLE<->STALE/DELAY/PROBE) with the
+					 * same lladdr - nothing a client needs to know, don't
+					 * trigger a full rescan+push for it */
+					continue;
+				action = r == NM_NEIGH_MAC_CHANGED ? "CHANGE" : "ADD";
+			}
+
 			char ipbuf[INET6_ADDRSTRLEN] = {0};
 			inet_ntop(ndm->ndm_family, dst, ipbuf, sizeof(ipbuf));
 			char macbuf[18] = {0};
 			if (lladdrlen == 6)
 				snprintf(macbuf, sizeof(macbuf), "%02x:%02x:%02x:%02x:%02x:%02x",
 					lladdr[0], lladdr[1], lladdr[2], lladdr[3], lladdr[4], lladdr[5]);
-
-			const char *action;
-			if (isDel) {
-				action = "REMOVE";
-				nm_neigh_forget(ndm->ndm_ifindex, ndm->ndm_family, dst);
-			} else {
-				action = nm_neigh_mark_known(ndm->ndm_ifindex, ndm->ndm_family, dst)
-					? "CHANGE" : "ADD";
-			}
 
 			if (verbose) LOG("netmon: NEIGH %s %s %s on %s state=%s\n",
 				action, ipbuf, macbuf, ifname, nm_neigh_state_name(ndm->ndm_state));
