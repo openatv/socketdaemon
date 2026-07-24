@@ -1366,7 +1366,9 @@ static int nm_neigh_parse_attrs(struct nlmsghdr *nlh, struct ndmsg *ndm,
  * NETNEIGHBORS_PATH and marks every reported candidate-state entry as known,
  * so the live RTM_NEWNEIGH/DELNEIGH handler in nm_handle_rtnetlink() below
  * correctly reports CHANGE (not another ADD) for entries already in this
- * initial dump. Called once at monitor_thread() startup. */
+ * initial dump. Called once at monitor_thread() startup, then again after
+ * every NEIGH ADD/CHANGE/REMOVE so the file doesn't go stale (see monitor_thread
+ * loop below). */
 static void nm_dump_neighbors(void)
 {
 	static char buf[NETMON_BUF_SIZE];
@@ -1739,6 +1741,7 @@ static void *monitor_thread(void *arg)
 			 * specific event handlers (LINK/IP/...) only touch a few
 			 * fields, not everything nm_gather_and_write() just refreshed. */
 			nm_gather_and_write(1);
+			nm_dump_neighbors(); /* keep /var/run/netneighbors current, not just the startup snapshot */
 			net_cli = nm_send_to_client(net_cli, evtbuf, evtlen);
 			net_cli = nm_send_to_client(net_cli, "UPDATE\n", 7);
 		} else if (r == 0) {
