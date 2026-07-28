@@ -21,6 +21,19 @@
  *                               (exitcode 0 = reply received, 1 = no reply)
  *   RESOLVE,<host>            → resolve <host> via getaddrinfo (AF_INET)
  *                               (exitcode 0 = resolved, 1 = failed)
+ *   NETSCAN,<cidr>,<port>[,<port>...]
+ *                             → active TCP connect-scan of <cidr> (max /24,
+ *                               i.e. up to 256 host addresses) against the
+ *                               given ports, writes /var/run/netscan
+ *                               (exitcode 0 = scan completed, 1 = bad params).
+ *                               Blocks the caller for the scan's duration
+ *                               (bounded, see NETSCAN block below) - same
+ *                               blocking-per-command model as PING above.
+ *
+ * In addition to on-demand NETSCAN, the daemon runs its own unattended
+ * discovery scan once at startup (SMB/NFS ports 445+2049 against the
+ * default-route interface's subnet), after waiting for that interface to
+ * have a usable IPv4 address - see nm_run_autoscan().
  */
 
 #include <sys/types.h>
@@ -39,7 +52,6 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <linux/if_addr.h>
-#include <linux/neighbour.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -51,6 +63,8 @@
 #include <stdarg.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <fcntl.h>
+#include <poll.h>
 
 #define CMD_SOCKET_NAME "/var/run/daemon.socket"
 #define CMD_START "START"
@@ -70,15 +84,12 @@
 #define WLANACTIVATOR_SH "/etc/init.d/wlanactivator"
 #define CMD_PING "PING"
 #define CMD_RESOLVE "RESOLVE"
+#define CMD_NETSCAN "NETSCAN"
 
 /* network monitor */
 #define NETINFO_PATH      "/var/run/netinfo"
 #define NETINFO_TMP       "/var/run/netinfo.tmp"
 
-/* Neighbor (ARP/NDP) snapshot */
-#define NETNEIGHBORS_PATH      "/var/run/netneighbors"
-#define NETNEIGHBORS_TMP       "/var/run/netneighbors.tmp"
-#define NM_NEIGH_MAX 128 /* fixed-size known-neighbor table, embedded box - no dynamic growth */
 /* Safety fallback interval – only fires if kernel emits no events (e.g.
  * DHCP renewal on kernel 3.14 does not generate RTMGRP_IPV4_IFADDR).
  * select() is blocking, so this costs zero CPU while waiting. */
@@ -149,8 +160,16 @@ static volatile sig_atomic_t running = 1;
 static pthread_t g_monitor_tid;
 static int g_stop_pipe[2] = {-1, -1};
 
+/* Serializes access to the netscan machinery's static scan/DNS-cache
+ * buffers (see NETSCAN block below) between two independent callers that
+ * run on different threads: CMD_NETSCAN (processMessage(), on the main
+ * accept-loop thread) and nm_run_autoscan() (on its own thread, spawned
+ * once by monitor_thread() at startup). */
+static pthread_mutex_t g_netscan_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 int processMessage(char *inData);
 static void *monitor_thread(void *arg);
+static void *nm_autoscan_thread(void *arg);
 
 static FILE *log_stream;
 
@@ -1221,244 +1240,6 @@ static int nm_evt(char *evtbuf, int off, int max, const char *fmt, ...)
 }
 
 /* ============================================================
- * Neighbor (ARP/NDP) table – Neighbor discovery provider for NetworkMounts.
- * See NETWORK_BROWSER_PLUGIN_V5.md section 5.3/30.1.6.
- *
- * Kernel state machine (linux/neighbour.h NUD_*): only REACHABLE/STALE/
- * DELAY/PROBE are "this address answered recently" - INCOMPLETE (ARP still
- * in flight) and FAILED are not useful discovery candidates and are never
- * reported as ADD/CHANGE. REMOVE is always reported regardless of the last
- * known state, so a consumer's candidate list stays in sync.
- * ============================================================ */
-
-static const char *nm_neigh_state_name(int state)
-{
-	switch (state) {
-	case NUD_INCOMPLETE: return "INCOMPLETE";
-	case NUD_REACHABLE:  return "REACHABLE";
-	case NUD_STALE:      return "STALE";
-	case NUD_DELAY:      return "DELAY";
-	case NUD_PROBE:      return "PROBE";
-	case NUD_FAILED:     return "FAILED";
-	case NUD_NOARP:      return "NOARP";
-	case NUD_PERMANENT:  return "PERMANENT";
-	default:             return "NONE";
-	}
-}
-
-static int nm_neigh_state_is_candidate(int state)
-{
-	return state == NUD_REACHABLE || state == NUD_STALE ||
-	       state == NUD_DELAY || state == NUD_PROBE;
-}
-
-/* Fixed-size "have we already told the client about this (ifindex,family,addr)"
- * table, plus the lladdr last reported for it - just enough to tell ADD from
- * a no-op NUD state re-affirmation from an actual MAC change; not a full
- * cache of neighbor data (the kernel already has that;
- * /var/run/networkbrowser/state/netneighbors.json is the authoritative
- * snapshot, see nm_dump_neighbors()). No dynamic growth, matches this file's
- * general embedded-box style (compare netmount_queue etc.); once full,
- * oldest-looking entries just don't get deduped perfectly, which only costs
- * an occasional spurious ADD instead of CHANGE - harmless. */
-typedef struct {
-	int used;
-	int ifindex;
-	unsigned char family;
-	unsigned char addr[16]; /* IPv4 uses first 4 bytes, IPv6 all 16 */
-	unsigned char lladdr[6];
-	unsigned char lladdrlen;
-} nm_neigh_key_t;
-
-static nm_neigh_key_t nm_known_neighbors[NM_NEIGH_MAX];
-
-static int nm_neigh_addrlen(int family)
-{
-	return family == AF_INET6 ? 16 : 4;
-}
-
-static nm_neigh_key_t *nm_neigh_find(int ifindex, int family, const void *addr)
-{
-	int addrlen = nm_neigh_addrlen(family);
-	for (int i = 0; i < NM_NEIGH_MAX; i++) {
-		nm_neigh_key_t *k = &nm_known_neighbors[i];
-		if (k->used && k->ifindex == ifindex && k->family == family &&
-		    memcmp(k->addr, addr, addrlen) == 0)
-			return k;
-	}
-	return NULL;
-}
-
-/* Marks (ifindex,family,addr) known and records its current lladdr.
- * Returns NM_NEIGH_ADDED (first time seen), NM_NEIGH_UNCHANGED (already
- * known, lladdr identical - pure NUD state churn like REACHABLE->STALE with
- * no new information), or NM_NEIGH_MAC_CHANGED (already known, lladdr
- * differs from what we last recorded - a real change worth reporting). */
-enum { NM_NEIGH_ADDED, NM_NEIGH_UNCHANGED, NM_NEIGH_MAC_CHANGED };
-
-static int nm_neigh_mark_known(int ifindex, int family, const void *addr,
-	const unsigned char *lladdr, int lladdrlen)
-{
-	nm_neigh_key_t *k = nm_neigh_find(ifindex, family, addr);
-	if (k) {
-		int changed = lladdrlen > 0 &&
-			(k->lladdrlen != lladdrlen || memcmp(k->lladdr, lladdr, lladdrlen) != 0);
-		if (lladdrlen > 0) {
-			memcpy(k->lladdr, lladdr, lladdrlen);
-			k->lladdrlen = (unsigned char)lladdrlen;
-		}
-		return changed ? NM_NEIGH_MAC_CHANGED : NM_NEIGH_UNCHANGED;
-	}
-	for (int i = 0; i < NM_NEIGH_MAX; i++) {
-		if (!nm_known_neighbors[i].used) {
-			nm_known_neighbors[i].used = 1;
-			nm_known_neighbors[i].ifindex = ifindex;
-			nm_known_neighbors[i].family = (unsigned char)family;
-			memcpy(nm_known_neighbors[i].addr, addr, nm_neigh_addrlen(family));
-			if (lladdrlen > 0) {
-				memcpy(nm_known_neighbors[i].lladdr, lladdr, lladdrlen);
-				nm_known_neighbors[i].lladdrlen = (unsigned char)lladdrlen;
-			}
-			return NM_NEIGH_ADDED;
-		}
-	}
-	/* table full - can't remember this one, treat every future sighting as
-	 * ADD; harmless (see struct comment above) */
-	return NM_NEIGH_ADDED;
-}
-
-static void nm_neigh_forget(int ifindex, int family, const void *addr)
-{
-	nm_neigh_key_t *k = nm_neigh_find(ifindex, family, addr);
-	if (k) k->used = 0;
-}
-
-/* Extracts NDA_DST/NDA_LLADDR from one RTM_NEWNEIGH/RTM_DELNEIGH message's
- * attributes. Returns 1 if a usable NDA_DST was found (an entry without one
- * isn't addressable and is skipped by callers), 0 otherwise. lladdr/lladdrlen
- * are optional (multicast/broadcast neighbor entries have none). */
-static int nm_neigh_parse_attrs(struct nlmsghdr *nlh, struct ndmsg *ndm,
-	unsigned char *dst, int *dstlen, unsigned char *lladdr, int *lladdrlen)
-{
-	int rtalen = (int)NLMSG_PAYLOAD(nlh, sizeof(*ndm));
-	struct rtattr *rta = (struct rtattr *)((char *)ndm + NLMSG_ALIGN(sizeof(*ndm)));
-	*dstlen = 0;
-	*lladdrlen = 0;
-	for (; RTA_OK(rta, rtalen); rta = RTA_NEXT(rta, rtalen)) {
-		if (rta->rta_type == NDA_DST) {
-			int len = RTA_PAYLOAD(rta);
-			if (len > 16) len = 16;
-			memcpy(dst, RTA_DATA(rta), len);
-			*dstlen = len;
-		} else if (rta->rta_type == NDA_LLADDR) {
-			int len = RTA_PAYLOAD(rta);
-			if (len > 6) len = 6;
-			memcpy(lladdr, RTA_DATA(rta), len);
-			*lladdrlen = len;
-		}
-	}
-	return *dstlen > 0;
-}
-
-/* Full RTM_GETNEIGH dump (same request/response pattern as
- * nm_scan_default_routes() above, just RTM_GETNEIGH/RTM_NEWNEIGH instead of
- * RTM_GETROUTE/RTM_NEWROUTE). Writes the authoritative snapshot to
- * NETNEIGHBORS_PATH and marks every reported candidate-state entry as known,
- * so the live RTM_NEWNEIGH/DELNEIGH handler in nm_handle_rtnetlink() below
- * correctly reports CHANGE (not another ADD) for entries already in this
- * initial dump. Called once at monitor_thread() startup, then again after
- * every NEIGH ADD/CHANGE/REMOVE so the file doesn't go stale (see monitor_thread
- * loop below). */
-static void nm_dump_neighbors(void)
-{
-	static char buf[NETMON_BUF_SIZE];
-	int off = 0;
-	int first = 1;
-
-	int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
-	if (sock < 0) { LOG("netmon: neigh dump socket: %s\n", strerror(errno)); return; }
-
-	struct {
-		struct nlmsghdr nlh;
-		struct ndmsg ndm;
-	} req;
-	memset(&req, 0, sizeof(req));
-	req.nlh.nlmsg_len = sizeof(req);
-	req.nlh.nlmsg_type = RTM_GETNEIGH;
-	req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
-	req.nlh.nlmsg_seq = 1;
-	req.ndm.ndm_family = AF_UNSPEC; /* both IPv4 and IPv6 */
-
-	if (send(sock, &req, req.nlh.nlmsg_len, 0) < 0) {
-		LOG("netmon: neigh dump send: %s\n", strerror(errno));
-		close(sock);
-		return;
-	}
-
-	off += snprintf(buf + off, sizeof(buf) - off, "{\n  \"neighbors\": [\n");
-
-	int done = 0;
-	char rbuf[8192];
-	while (!done) {
-		ssize_t len = recv(sock, rbuf, sizeof(rbuf), 0);
-		if (len <= 0) break;
-
-		struct nlmsghdr *nlh = (struct nlmsghdr *)rbuf;
-		for (; NLMSG_OK(nlh, (size_t)len); nlh = NLMSG_NEXT(nlh, len)) {
-			if (nlh->nlmsg_type == NLMSG_DONE || nlh->nlmsg_type == NLMSG_ERROR) {
-				done = 1;
-				break;
-			}
-			if (nlh->nlmsg_type != RTM_NEWNEIGH) continue;
-
-			struct ndmsg *ndm = (struct ndmsg *)NLMSG_DATA(nlh);
-			if (!nm_neigh_state_is_candidate(ndm->ndm_state)) continue;
-
-			char ifname[IFNAMSIZ] = {0};
-			if_indextoname(ndm->ndm_ifindex, ifname);
-			if (!ifname[0] || strcmp(ifname, "lo") == 0) continue;
-
-			unsigned char dst[16], lladdr[6];
-			int dstlen = 0, lladdrlen = 0;
-			if (!nm_neigh_parse_attrs(nlh, ndm, dst, &dstlen, lladdr, &lladdrlen))
-				continue;
-
-			char ipbuf[INET6_ADDRSTRLEN] = {0};
-			inet_ntop(ndm->ndm_family, dst, ipbuf, sizeof(ipbuf));
-			char macbuf[18] = {0};
-			if (lladdrlen == 6)
-				snprintf(macbuf, sizeof(macbuf), "%02x:%02x:%02x:%02x:%02x:%02x",
-					lladdr[0], lladdr[1], lladdr[2], lladdr[3], lladdr[4], lladdr[5]);
-
-			nm_neigh_mark_known(ndm->ndm_ifindex, ndm->ndm_family, dst, lladdr, lladdrlen);
-
-			if (off < (int)sizeof(buf) - 300) {
-				off += snprintf(buf + off, sizeof(buf) - off,
-					"%s    {\"family\": %d, \"address\": \"%s\", \"lladdr\": \"%s\", "
-					"\"ifindex\": %d, \"interface\": \"%s\", \"state\": \"%s\"}",
-					first ? "" : ",\n", ndm->ndm_family == AF_INET6 ? 6 : 4,
-					ipbuf, macbuf, ndm->ndm_ifindex, ifname,
-					nm_neigh_state_name(ndm->ndm_state));
-				first = 0;
-			}
-		}
-	}
-	close(sock);
-
-	off += snprintf(buf + off, sizeof(buf) - off, "\n  ]\n}\n");
-
-	FILE *out = fopen(NETNEIGHBORS_TMP, "w");
-	if (out) {
-		fputs(buf, out);
-		fclose(out);
-		rename(NETNEIGHBORS_TMP, NETNEIGHBORS_PATH);
-		if (verbose) LOG("netmon: wrote %s (%d bytes)\n", NETNEIGHBORS_PATH, off);
-	} else {
-		LOG("netmon: cannot write %s: %s\n", NETNEIGHBORS_TMP, strerror(errno));
-	}
-}
-
-/* ============================================================
  * NETLINK_ROUTE parser → structured event lines
  * ============================================================ */
 
@@ -1528,55 +1309,6 @@ static int nm_handle_rtnetlink(int nls, char *evtbuf, int evtmax)
 				ifname, ipbuf, ifa->ifa_prefixlen);
 			off = nm_evt(evtbuf, off, evtmax, "IP,%s,%s/%d\n",
 				ifname, ipbuf, ifa->ifa_prefixlen);
-		}
-		else if (nlh->nlmsg_type == RTM_NEWNEIGH || nlh->nlmsg_type == RTM_DELNEIGH) {
-			struct ndmsg *ndm = (struct ndmsg *)NLMSG_DATA(nlh);
-			if (ndm->ndm_family != AF_INET && ndm->ndm_family != AF_INET6) continue;
-
-			char ifname[IFNAMSIZ] = {0};
-			if_indextoname(ndm->ndm_ifindex, ifname);
-			if (!ifname[0] || strcmp(ifname, "lo") == 0) continue;
-
-			unsigned char dst[16], lladdr[6];
-			int dstlen = 0, lladdrlen = 0;
-			if (!nm_neigh_parse_attrs(nlh, ndm, dst, &dstlen, lladdr, &lladdrlen))
-				continue; /* no NDA_DST, nothing addressable to report */
-
-			int isDel = (nlh->nlmsg_type == RTM_DELNEIGH);
-			if (!isDel && !nm_neigh_state_is_candidate(ndm->ndm_state)) {
-				/* INCOMPLETE/FAILED etc. - not yet/no longer a useful
-				 * candidate, don't report and don't mark known so a later
-				 * transition into a candidate state still reports ADD */
-				continue;
-			}
-
-			const char *action;
-			if (isDel) {
-				action = "REMOVE";
-				nm_neigh_forget(ndm->ndm_ifindex, ndm->ndm_family, dst);
-			} else {
-				int r = nm_neigh_mark_known(ndm->ndm_ifindex, ndm->ndm_family, dst,
-					lladdr, lladdrlen);
-				if (r == NM_NEIGH_UNCHANGED)
-					/* pure NUD aging (REACHABLE<->STALE/DELAY/PROBE) with the
-					 * same lladdr - nothing a client needs to know, don't
-					 * trigger a full rescan+push for it */
-					continue;
-				action = r == NM_NEIGH_MAC_CHANGED ? "CHANGE" : "ADD";
-			}
-
-			char ipbuf[INET6_ADDRSTRLEN] = {0};
-			inet_ntop(ndm->ndm_family, dst, ipbuf, sizeof(ipbuf));
-			char macbuf[18] = {0};
-			if (lladdrlen == 6)
-				snprintf(macbuf, sizeof(macbuf), "%02x:%02x:%02x:%02x:%02x:%02x",
-					lladdr[0], lladdr[1], lladdr[2], lladdr[3], lladdr[4], lladdr[5]);
-
-			if (verbose) LOG("netmon: NEIGH %s %s %s on %s state=%s\n",
-				action, ipbuf, macbuf, ifname, nm_neigh_state_name(ndm->ndm_state));
-			off = nm_evt(evtbuf, off, evtmax, "NEIGH,%s,%d,%d,%s,%s,%s,%s\n",
-				action, ndm->ndm_family == AF_INET6 ? 6 : 4, ndm->ndm_ifindex,
-				ifname, ipbuf, macbuf, nm_neigh_state_name(ndm->ndm_state));
 		}
 	}
 	return off;
@@ -1656,7 +1388,7 @@ static void *monitor_thread(void *arg)
 	if (nls < 0) { LOG("netmon: netlink socket: %s\n", strerror(errno)); goto out; }
 	memset(&sa, 0, sizeof(sa));
 	sa.nl_family = AF_NETLINK;
-	sa.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR | RTMGRP_NEIGH;
+	sa.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
 	if (bind(nls, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
 		LOG("netmon: netlink bind: %s\n", strerror(errno)); goto out;
 	}
@@ -1680,7 +1412,15 @@ static void *monitor_thread(void *arg)
 	net_srv = nm_setup_event_server();
 
 	nm_gather_and_write(1); /* initial scan */
-	nm_dump_neighbors(); /* initial neighbor snapshot, see section 5.3/30.1.6 */
+
+	/* unattended SMB/NFS discovery (see NETSCAN block below) - own thread,
+	 * since its "wait for an IP" step can block indefinitely and must not
+	 * hold up this thread's own event loop below */
+	pthread_t autoscanTid;
+	if (pthread_create(&autoscanTid, NULL, nm_autoscan_thread, NULL) == 0)
+		pthread_detach(autoscanTid);
+	else if (verbose)
+		LOG("netscan: autoscan thread create failed: %s\n", strerror(errno));
 
 	while (running) {
 		fd_set fds;
@@ -1741,7 +1481,6 @@ static void *monitor_thread(void *arg)
 			 * specific event handlers (LINK/IP/...) only touch a few
 			 * fields, not everything nm_gather_and_write() just refreshed. */
 			nm_gather_and_write(1);
-			nm_dump_neighbors(); /* keep /var/run/netneighbors current, not just the startup snapshot */
 			net_cli = nm_send_to_client(net_cli, evtbuf, evtlen);
 			net_cli = nm_send_to_client(net_cli, "UPDATE\n", 7);
 		} else if (r == 0) {
@@ -2035,6 +1774,551 @@ static int doResolve(const char *host)
 	return (rc == 0) ? 0 : 1;
 }
 
+/* ============================================================
+ * NETSCAN – active TCP connect-scan for host/service discovery. Replaces
+ * the earlier passive ARP/NDP neighbor-table snapshot approach, which only
+ * ever listed hosts this box had already exchanged link-layer traffic
+ * with - close to empty on a quiet LAN. This actively probes every host
+ * address in a given range against a small port list and writes the
+ * result to /var/run/netscan.
+ *
+ * Two callers, both serialized via g_netscan_mutex (see declaration
+ * above) since they'd otherwise race on the static result/DNS-cache
+ * buffers below:
+ *   - CMD_NETSCAN (processMessage() below) - caller-specified range/ports,
+ *     runs synchronously like every other command in this file (blocks the
+ *     requesting client for the scan's duration, same as doPing()'s 2s
+ *     block - fine since the scan itself is bounded, see below).
+ *   - nm_run_autoscan() - unattended, fixed SMB/NFS ports, run twice 3s
+ *     apart once at monitor_thread() startup, in that thread (so it never
+ *     blocks the daemon.socket accept loop, which lives in main()).
+ *
+ * Non-blocking connect()+poll() in fixed-size batches keeps the scan
+ * itself bounded by NETSCAN_TIMEOUT_MS per batch, not per host - a
+ * dead/unused IP (no ARP reply, connect() would otherwise hang) costs no
+ * more than any live one, so a full /24 across a handful of ports finishes
+ * in low single-digit seconds worst case even against an all-dead subnet.
+ *
+ * Each unique open host is additionally reverse-DNS-resolved (PTR query).
+ * This is a minimal hand-rolled UDP DNS client, not getnameinfo()/
+ * gethostbyaddr(): those block on the system resolver with no
+ * caller-controllable timeout (several seconds per host on an unreachable
+ * or non-responding nameserver), which would defeat the point of bounding
+ * the scan at all. Bounded by DNS_TIMEOUT_MS via poll(), one nameserver
+ * (the first one in /etc/resolv.conf), one UDP datagram, one wait, no
+ * retries.
+ * ============================================================ */
+
+#define NETSCAN_PATH        "/var/run/netscan"
+#define NETSCAN_TMP         "/var/run/netscan.tmp"
+#define NETSCAN_MAX_HOSTS   256   /* caller must chunk anything bigger than a /24 */
+#define NETSCAN_MAX_PORTS   8
+#define NETSCAN_BATCH       256   /* concurrent in-flight connects */
+#define NETSCAN_TIMEOUT_MS  400   /* per batch, not per host */
+#define NETSCAN_MAX_OPEN    256   /* result buffer cap */
+#define DNS_TIMEOUT_MS      300   /* per host, reverse PTR lookup */
+#define DNS_NAME_MAX        256
+
+typedef struct {
+	uint32_t ip;   /* host order */
+	uint16_t port;
+	int fd;
+} nm_scan_slot_t;
+
+typedef struct {
+	uint32_t ip;   /* host order */
+	uint16_t port;
+} nm_scan_open_t;
+
+/* Polls up to n in-flight non-blocking connects to completion or
+ * NETSCAN_TIMEOUT_MS, whichever comes first; appends successes to
+ * open[]/*openCount and closes every fd before returning. */
+static void nm_scan_run_batch(nm_scan_slot_t *slots, int n,
+	nm_scan_open_t *open, int *openCount, int openMax)
+{
+	struct pollfd pfds[NETSCAN_BATCH];
+	for (int i = 0; i < n; i++) {
+		pfds[i].fd = slots[i].fd;
+		pfds[i].events = POLLOUT;
+		pfds[i].revents = 0;
+	}
+
+	struct timespec deadline;
+	clock_gettime(CLOCK_MONOTONIC, &deadline);
+	deadline.tv_sec += NETSCAN_TIMEOUT_MS / 1000;
+	deadline.tv_nsec += (long)(NETSCAN_TIMEOUT_MS % 1000) * 1000000L;
+	if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+
+	int remaining = n;
+	while (remaining > 0) {
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		long remainMs = (deadline.tv_sec - now.tv_sec) * 1000 +
+			(deadline.tv_nsec - now.tv_nsec) / 1000000L;
+		if (remainMs <= 0)
+			break;
+
+		if (poll(pfds, n, (int)remainMs) <= 0)
+			break;
+
+		for (int i = 0; i < n; i++) {
+			if (pfds[i].fd < 0 || pfds[i].revents == 0)
+				continue;
+			int err = 0;
+			socklen_t elen = sizeof(err);
+			getsockopt(pfds[i].fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+			if (err == 0 && *openCount < openMax) {
+				open[*openCount].ip = slots[i].ip;
+				open[*openCount].port = slots[i].port;
+				(*openCount)++;
+			}
+			close(pfds[i].fd);
+			pfds[i].fd = -1;
+			remaining--;
+		}
+	}
+
+	for (int i = 0; i < n; i++) {
+		if (pfds[i].fd >= 0)
+			close(pfds[i].fd);
+	}
+}
+
+/* Decodes a (possibly compressed) DNS name starting at pkt[offset] into
+ * out (dot-separated, NUL-terminated). Returns the number of bytes the
+ * name occupied in the original stream starting at offset (2 if it was
+ * just a compression pointer), or -1 on a malformed/out-of-bounds name. */
+static int nm_dns_read_name(const unsigned char *pkt, int pktlen, int offset, char *out, int outsz)
+{
+	int outlen = 0;
+	int pos = offset;
+	int consumed = -1;
+	int jumps = 0;
+
+	while (pos < pktlen) {
+		int len = pkt[pos];
+		if (len == 0) {
+			pos++;
+			if (consumed < 0) consumed = pos - offset;
+			break;
+		}
+		if ((len & 0xC0) == 0xC0) {
+			if (pos + 1 >= pktlen) return -1;
+			if (consumed < 0) consumed = pos - offset + 2;
+			if (++jumps > 20) return -1; /* guard against pointer loops */
+			pos = ((len & 0x3F) << 8) | pkt[pos + 1];
+			continue;
+		}
+		pos++;
+		if (pos + len > pktlen || outlen + len + 1 >= outsz)
+			return -1;
+		if (outlen > 0)
+			out[outlen++] = '.';
+		memcpy(out + outlen, pkt + pos, len);
+		outlen += len;
+		pos += len;
+	}
+	out[outlen] = '\0';
+	return consumed;
+}
+
+/* A PTR response can come from any nameserver reachable on the LAN,
+ * including a spoofed/malicious one - the name it returns is untrusted
+ * input that ends up embedded verbatim in a JSON file. Replace anything
+ * outside the standard hostname charset so it can't be broken/injected
+ * into by a crafted reply. */
+static void nm_sanitize_hostname(char *s)
+{
+	for (; *s; s++) {
+		char c = *s;
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		      (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_'))
+			*s = '_';
+	}
+}
+
+/* RFC1918 addresses have no real public reverse delegation, yet many ISP
+ * resolvers answer any unknown PTR query with a synthesized name instead of
+ * NXDOMAIN - typically "<ip-with-dashes>.<something>.<isp-domain>", e.g.
+ * "192-168-2-102.r.airtelkenya.com" for 192.168.2.102. Treat a PTR result
+ * that literally embeds the queried IP (dotted octets, dash-joined, either
+ * order) as such a catch-all rather than a real local hostname. */
+static int nm_looks_like_isp_wildcard(const char *name, uint32_t ip)
+{
+	unsigned a = (ip >> 24) & 0xFF, b = (ip >> 16) & 0xFF, c = (ip >> 8) & 0xFF, d = ip & 0xFF;
+	char forward[20], reversed[20];
+	snprintf(forward, sizeof(forward), "%u-%u-%u-%u", a, b, c, d);
+	snprintf(reversed, sizeof(reversed), "%u-%u-%u-%u", d, c, b, a);
+	return strstr(name, forward) != NULL || strstr(name, reversed) != NULL;
+}
+
+/* Reverse-resolves ip (host order) to a hostname via a single PTR query to
+ * the first nameserver in /etc/resolv.conf, bounded by DNS_TIMEOUT_MS.
+ * Leaves out[0] = '\0' on any failure/timeout/missing resolv.conf. */
+static void nm_dns_reverse_lookup(uint32_t ip, char *out, size_t outsz)
+{
+	out[0] = '\0';
+
+	char nsIp[64] = {0};
+	FILE *f = fopen("/etc/resolv.conf", "r");
+	if (!f)
+		return;
+	char line[256];
+	while (fgets(line, sizeof(line), f)) {
+		char probe[64];
+		if (sscanf(line, "nameserver %63s", probe) == 1) {
+			strncpy(nsIp, probe, sizeof(nsIp) - 1);
+			break;
+		}
+	}
+	fclose(f);
+	if (!nsIp[0])
+		return;
+
+	struct sockaddr_in ns;
+	memset(&ns, 0, sizeof(ns));
+	ns.sin_family = AF_INET;
+	ns.sin_port = htons(53);
+	if (inet_pton(AF_INET, nsIp, &ns.sin_addr) != 1)
+		return;
+
+	unsigned char q[300];
+	int qlen = 0;
+	unsigned short qid = (unsigned short)(getpid() ^ (int)ip);
+	q[qlen++] = qid >> 8; q[qlen++] = qid & 0xFF;
+	q[qlen++] = 0x01; q[qlen++] = 0x00; /* flags: recursion desired */
+	q[qlen++] = 0x00; q[qlen++] = 0x01; /* QDCOUNT = 1 */
+	q[qlen++] = 0x00; q[qlen++] = 0x00; /* ANCOUNT */
+	q[qlen++] = 0x00; q[qlen++] = 0x00; /* NSCOUNT */
+	q[qlen++] = 0x00; q[qlen++] = 0x00; /* ARCOUNT */
+
+	/* in-addr.arpa requires octets in reverse order (d.c.b.a for a.b.c.d) */
+	for (int i = 0; i <= 3; i++) {
+		unsigned char octet = (unsigned char)((ip >> (i * 8)) & 0xFF);
+		char lbl[4];
+		int llen = snprintf(lbl, sizeof(lbl), "%u", octet);
+		q[qlen++] = (unsigned char)llen;
+		memcpy(q + qlen, lbl, llen);
+		qlen += llen;
+	}
+	q[qlen++] = 7; memcpy(q + qlen, "in-addr", 7); qlen += 7;
+	q[qlen++] = 4; memcpy(q + qlen, "arpa", 4); qlen += 4;
+	q[qlen++] = 0x00;           /* end of QNAME */
+	q[qlen++] = 0x00; q[qlen++] = 0x0C; /* QTYPE = PTR */
+	q[qlen++] = 0x00; q[qlen++] = 0x01; /* QCLASS = IN */
+
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return;
+	if (sendto(fd, q, qlen, 0, (struct sockaddr *)&ns, sizeof(ns)) < 0) {
+		close(fd);
+		return;
+	}
+
+	struct pollfd pfd;
+	pfd.fd = fd;
+	pfd.events = POLLIN;
+	if (poll(&pfd, 1, DNS_TIMEOUT_MS) <= 0) {
+		close(fd);
+		return;
+	}
+
+	unsigned char resp[512];
+	ssize_t rlen = recv(fd, resp, sizeof(resp), 0);
+	close(fd);
+	if (rlen < 12)
+		return;
+
+	unsigned short rid = (unsigned short)((resp[0] << 8) | resp[1]);
+	int rcode = resp[3] & 0x0F;
+	int ancount = (resp[6] << 8) | resp[7];
+	if (rid != qid || rcode != 0 || ancount == 0)
+		return;
+
+	char skip[DNS_NAME_MAX];
+	int pos = 12;
+	int n = nm_dns_read_name(resp, (int)rlen, pos, skip, sizeof(skip));
+	if (n < 0)
+		return;
+	pos += n + 4; /* + QTYPE/QCLASS */
+
+	for (int i = 0; i < ancount && pos < (int)rlen; i++) {
+		int rn = nm_dns_read_name(resp, (int)rlen, pos, skip, sizeof(skip));
+		if (rn < 0)
+			return;
+		pos += rn;
+		if (pos + 10 > (int)rlen)
+			return;
+		int type = (resp[pos] << 8) | resp[pos + 1];
+		int rdlen = (resp[pos + 8] << 8) | resp[pos + 9];
+		pos += 10;
+		if (pos + rdlen > (int)rlen)
+			return;
+		if (type == 12) { /* PTR */
+			char name[DNS_NAME_MAX];
+			if (nm_dns_read_name(resp, (int)rlen, pos, name, sizeof(name)) > 0 &&
+			    !nm_looks_like_isp_wildcard(name, ip)) {
+				nm_sanitize_hostname(name);
+				strncpy(out, name, outsz - 1);
+				out[outsz - 1] = '\0';
+			}
+			return;
+		}
+		pos += rdlen;
+	}
+}
+
+typedef struct {
+	uint32_t ip;
+	char name[DNS_NAME_MAX];
+} nm_dns_cache_t;
+
+/* Resolves ip via nm_dns_reverse_lookup(), caching per unique ip so a host
+ * with several open ports is only queried once. Returns "" (never NULL)
+ * if unresolved. Caller must hold g_netscan_mutex (static cache). */
+static const char *nm_dns_resolve_cached(uint32_t ip)
+{
+	static nm_dns_cache_t cache[NETSCAN_MAX_OPEN];
+	static int count = 0;
+
+	for (int i = 0; i < count; i++)
+		if (cache[i].ip == ip)
+			return cache[i].name;
+	if (count >= NETSCAN_MAX_OPEN)
+		return "";
+
+	nm_dns_cache_t *e = &cache[count++];
+	e->ip = ip;
+	e->name[0] = '\0';
+	nm_dns_reverse_lookup(ip, e->name, sizeof(e->name));
+	return e->name;
+}
+
+/* Core scan: probes every host in (network, broadcast) against ports[],
+ * reverse-DNS-resolves whatever answered, writes NETSCAN_PATH. Caller must
+ * hold g_netscan_mutex - this function touches the static result/DNS-cache
+ * buffers above and isn't safe to run concurrently with itself. Silently
+ * does nothing if the host count is out of range (0 or > NETSCAN_MAX_HOSTS,
+ * i.e. bigger than a /24). */
+static void nm_netscan_core(uint32_t network, uint32_t broadcast, const uint16_t *ports, int portCount)
+{
+	uint32_t hostCount = (broadcast > network + 1) ? (broadcast - network - 1) : 0;
+	if (hostCount == 0 || hostCount > NETSCAN_MAX_HOSTS)
+		return;
+
+	static nm_scan_open_t openResults[NETSCAN_MAX_OPEN];
+	int openCount = 0;
+
+	nm_scan_slot_t slots[NETSCAN_BATCH];
+	int slotCount = 0;
+
+	for (uint32_t h = network + 1; h < broadcast; h++) {
+		for (int pi = 0; pi < portCount; pi++) {
+			if (slotCount == NETSCAN_BATCH) {
+				nm_scan_run_batch(slots, slotCount, openResults, &openCount, NETSCAN_MAX_OPEN);
+				slotCount = 0;
+			}
+
+			int fd = socket(AF_INET, SOCK_STREAM, 0);
+			if (fd < 0)
+				continue;
+			int flags = fcntl(fd, F_GETFL, 0);
+			fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+			struct sockaddr_in dst;
+			memset(&dst, 0, sizeof(dst));
+			dst.sin_family = AF_INET;
+			dst.sin_port = htons(ports[pi]);
+			dst.sin_addr.s_addr = htonl(h);
+
+			int cr = connect(fd, (struct sockaddr *)&dst, sizeof(dst));
+			if (cr == 0) {
+				/* connected instantly (rare, e.g. same box) */
+				if (openCount < NETSCAN_MAX_OPEN) {
+					openResults[openCount].ip = h;
+					openResults[openCount].port = ports[pi];
+					openCount++;
+				}
+				close(fd);
+				continue;
+			}
+			if (errno != EINPROGRESS) {
+				close(fd);
+				continue;
+			}
+
+			slots[slotCount].ip = h;
+			slots[slotCount].port = ports[pi];
+			slots[slotCount].fd = fd;
+			slotCount++;
+		}
+	}
+	if (slotCount > 0)
+		nm_scan_run_batch(slots, slotCount, openResults, &openCount, NETSCAN_MAX_OPEN);
+
+	static char buf[8192];
+	int off = 0;
+	off += snprintf(buf + off, sizeof(buf) - off, "{\n  \"scan\": [\n");
+	for (int i = 0; i < openCount && off < (int)sizeof(buf) - 100; i++) {
+		struct in_addr a;
+		a.s_addr = htonl(openResults[i].ip);
+		char ipbuf[INET_ADDRSTRLEN];
+		inet_ntop(AF_INET, &a, ipbuf, sizeof(ipbuf));
+		const char *hostname = nm_dns_resolve_cached(openResults[i].ip);
+		off += snprintf(buf + off, sizeof(buf) - off,
+			"%s    {\"address\": \"%s\", \"port\": %u, \"state\": \"open\", \"hostname\": \"%s\"}",
+			i == 0 ? "" : ",\n", ipbuf, openResults[i].port, hostname);
+	}
+	off += snprintf(buf + off, sizeof(buf) - off, "\n  ]\n}\n");
+
+	FILE *out = fopen(NETSCAN_TMP, "w");
+	if (!out) {
+		LOG("netscan: cannot write %s: %s\n", NETSCAN_TMP, strerror(errno));
+		return;
+	}
+	fputs(buf, out);
+	fclose(out);
+	rename(NETSCAN_TMP, NETSCAN_PATH);
+	if (verbose)
+		LOG("netscan: wrote %s (%d open of %u scanned)\n", NETSCAN_PATH, openCount, hostCount);
+}
+
+/* Parses "a.b.c.d/prefix,port[,port...]" and runs nm_netscan_core(). Caller
+ * must hold g_netscan_mutex. Returns 0 if the scan ran (regardless of how
+ * many ports came back open), 1 on a parameter error. */
+static int doNetscan(const char *data)
+{
+	char dataCopy[256];
+	strncpy(dataCopy, data, sizeof(dataCopy) - 1);
+	dataCopy[sizeof(dataCopy) - 1] = '\0';
+
+	char *saveptr = NULL;
+	char *cidrPart = strtok_r(dataCopy, ",", &saveptr);
+	if (!cidrPart)
+		return 1;
+
+	char *slash = strchr(cidrPart, '/');
+	if (!slash)
+		return 1;
+	*slash = '\0';
+	int prefix = atoi(slash + 1);
+	if (prefix < 8 || prefix > 30)
+		return 1;
+
+	struct in_addr netAddr;
+	if (inet_pton(AF_INET, cidrPart, &netAddr) != 1)
+		return 1;
+
+	uint16_t ports[NETSCAN_MAX_PORTS];
+	int portCount = 0;
+	char *portTok;
+	while ((portTok = strtok_r(NULL, ",", &saveptr)) != NULL && portCount < NETSCAN_MAX_PORTS) {
+		int p = atoi(portTok);
+		if (p <= 0 || p > 65535)
+			continue;
+		ports[portCount++] = (uint16_t)p;
+	}
+	if (portCount == 0)
+		return 1;
+
+	uint32_t base = ntohl(netAddr.s_addr);
+	uint32_t hostBits = 32 - (uint32_t)prefix;
+	uint32_t network = base & (~0u << hostBits);
+	uint32_t broadcast = network | ~(~0u << hostBits);
+
+	nm_netscan_core(network, broadcast, ports, portCount);
+	return 0;
+}
+
+/* Reads ifindex's IPv4 address + prefix length via SIOCGIFADDR/
+ * SIOCGIFNETMASK. Returns 0 on any failure (no address assigned yet,
+ * ioctl error, ...), 1 on success. */
+static int nm_get_ifindex_ipv4(unsigned int ifindex, uint32_t *outIp, int *outPrefix)
+{
+	char ifname[IFNAMSIZ] = {0};
+	if (!if_indextoname(ifindex, ifname))
+		return 0;
+
+	int sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sock < 0)
+		return 0;
+
+	struct ifreq ifr;
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+	if (ioctl(sock, SIOCGIFADDR, &ifr) < 0) { close(sock); return 0; }
+	uint32_t ip = ntohl(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr);
+
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+	if (ioctl(sock, SIOCGIFNETMASK, &ifr) < 0) { close(sock); return 0; }
+	uint32_t mask = ntohl(((struct sockaddr_in *)&ifr.ifr_netmask)->sin_addr.s_addr);
+	close(sock);
+
+	if (ip == 0 || mask == 0 || mask == 0xFFFFFFFF)
+		return 0;
+
+	*outIp = ip;
+	*outPrefix = __builtin_popcount(mask);
+	return 1;
+}
+
+/* Unattended discovery: waits (polling every second) until the interface
+ * owning the system's default route has a usable IPv4 address, then runs
+ * nm_netscan_core() against that interface's subnet with fixed SMB/NFS
+ * ports, sleeps 3s (lets ARP/routing settle a little further, catches
+ * neighbors that were still INCOMPLETE on the first pass), and scans once
+ * more. Ports are fixed (not caller-specified) since this runs unattended
+ * with no caller to ask.
+ *
+ * The "wait until ready" loop can block for as long as the box takes to
+ * get an IP (DHCP still negotiating, cable unplugged, WiFi not yet
+ * associated - could be indefinite). monitor_thread()'s own while(running)
+ * loop is its actual job (LINK/IP/IFACE events, the daemon_net.socket
+ * accept()) and must keep running regardless, so this never runs inline in
+ * that thread - see nm_autoscan_thread() below, spawned once at startup. */
+static void nm_run_autoscan(void)
+{
+	static const uint16_t ports[] = { 445, 2049 };
+	uint32_t ip = 0;
+	int prefix = 0;
+
+	while (running) {
+		struct nm_default_route routes[NM_MAX_DEFAULT_ROUTES];
+		unsigned int winner = 0;
+		nm_scan_default_routes(routes, NM_MAX_DEFAULT_ROUTES, &winner);
+		if (winner != 0 && nm_get_ifindex_ipv4(winner, &ip, &prefix) &&
+		    prefix >= 8 && prefix <= 30)
+			break;
+		sleep(1);
+	}
+	if (!running)
+		return;
+
+	uint32_t hostBits = 32 - (uint32_t)prefix;
+	uint32_t network = ip & (~0u << hostBits);
+	uint32_t broadcast = network | ~(~0u << hostBits);
+
+	pthread_mutex_lock(&g_netscan_mutex);
+	nm_netscan_core(network, broadcast, ports, 2);
+	pthread_mutex_unlock(&g_netscan_mutex);
+
+	sleep(3);
+	if (!running)
+		return;
+
+	pthread_mutex_lock(&g_netscan_mutex);
+	nm_netscan_core(network, broadcast, ports, 2);
+	pthread_mutex_unlock(&g_netscan_mutex);
+}
+
+static void *nm_autoscan_thread(void *arg)
+{
+	(void)arg;
+	nm_run_autoscan();
+	return NULL;
+}
+
 int processMessage(char *inData)
 {
 	char *tmp;
@@ -2170,6 +2454,14 @@ int processMessage(char *inData)
 	{
 		int ok = (doResolve(data) == 0);
 		if (verbose) LOG("resolve %s -> %s\n", data, ok ? "OK" : "FAIL");
+		rc = ok ? 0 : (1 << 8);
+	}
+	else if (strcmp(command, CMD_NETSCAN) == 0)
+	{
+		pthread_mutex_lock(&g_netscan_mutex);
+		int ok = (doNetscan(data) == 0);
+		pthread_mutex_unlock(&g_netscan_mutex);
+		if (verbose) LOG("netscan %s -> %s\n", data, ok ? "OK" : "FAIL");
 		rc = ok ? 0 : (1 << 8);
 	}
 	else
