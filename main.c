@@ -911,9 +911,9 @@ static int nm_gather_and_write(int force)
 		return 0;
 	}
 
-	/* every interface's own default route metric is reported below, but only
+	/* every interface's own default route (gw + metric) is reported below;
 	 * the interface that owns the system's single active default gateway
-	 * gets a "gw" field (see nm_scan_default_routes()) */
+	 * additionally gets "defgw": 1 (see nm_scan_default_routes()) */
 	struct nm_default_route defRoutes[NM_MAX_DEFAULT_ROUTES];
 	unsigned int defGwWinnerIfindex = 0;
 	int defRouteCount = nm_scan_default_routes(defRoutes, NM_MAX_DEFAULT_ROUTES, &defGwWinnerIfindex);
@@ -975,6 +975,7 @@ static int nm_gather_and_write(int force)
 		char gwbuf[INET_ADDRSTRLEN] = {};
 		unsigned int gwMetric = 0;
 		int haveGwMetric = 0;
+		int isDefGw = 0;
 		int prefix = -1;
 		memset(&ifr, 0, sizeof(ifr));
 		strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
@@ -1001,8 +1002,8 @@ static int nm_gather_and_write(int force)
 				if (defRoutes[i].ifindex != ifindex) continue;
 				gwMetric = defRoutes[i].metric;
 				haveGwMetric = 1;
-				if (ifindex == defGwWinnerIfindex)
-					inet_ntop(AF_INET, &defRoutes[i].gw, gwbuf, sizeof(gwbuf));
+				inet_ntop(AF_INET, &defRoutes[i].gw, gwbuf, sizeof(gwbuf));
+				isDefGw = (ifindex == defGwWinnerIfindex);
 				break;
 			}
 		}
@@ -1069,6 +1070,9 @@ static int nm_gather_and_write(int force)
 			if (haveGwMetric)
 				off += snprintf(buf + off, sizeof(buf) - off,
 					",\n      \"metric\": %u", gwMetric);
+			if (isDefGw)
+				off += snprintf(buf + off, sizeof(buf) - off,
+					",\n      \"defgw\": 1");
 		}
 		if (ip6buf[0])
 			off += snprintf(buf + off, sizeof(buf) - off,
