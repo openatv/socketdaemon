@@ -46,6 +46,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <net/if.h>
+#include <ifaddrs.h>
 #include <netdb.h>
 #include <linux/ethtool.h>
 #include <linux/sockios.h>
@@ -53,6 +54,7 @@
 #include <linux/rtnetlink.h>
 #include <linux/if_addr.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2098,17 +2100,46 @@ static const char *nm_dns_resolve_cached(uint32_t ip)
 	return e->name;
 }
 
-/* Core scan: probes every host in (network, broadcast) against ports[],
- * reverse-DNS-resolves whatever answered, writes NETSCAN_PATH. Caller must
- * hold g_netscan_mutex - this function touches the static result/DNS-cache
- * buffers above and isn't safe to run concurrently with itself. Silently
- * does nothing if the host count is out of range (0 or > NETSCAN_MAX_HOSTS,
- * i.e. bigger than a /24). */
+#define NM_MAX_OWN_IPS 16
+
+/* Fills outIps[] (host order) with every non-loopback IPv4 address currently
+ * assigned to this box, across all interfaces - a box can have more than one
+ * (LAN + WiFi, an alias, ...), so a single caller-supplied address isn't
+ * enough to reliably exclude ourselves from a scan. Returns the count
+ * written (capped at maxIps). */
+static int nm_get_own_ipv4_addrs(uint32_t *outIps, int maxIps)
+{
+	struct ifaddrs *ifaddr = NULL;
+	if (getifaddrs(&ifaddr) != 0)
+		return 0;
+	int count = 0;
+	for (struct ifaddrs *ifa = ifaddr; ifa && count < maxIps; ifa = ifa->ifa_next) {
+		if (!ifa->ifa_addr || (ifa->ifa_flags & IFF_LOOPBACK))
+			continue;
+		if (ifa->ifa_addr->sa_family != AF_INET)
+			continue;
+		outIps[count++] = ntohl(((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr);
+	}
+	freeifaddrs(ifaddr);
+	return count;
+}
+
+/* Core scan: probes every host in (network, broadcast) except this box's own
+ * addresses against ports[], reverse-DNS-resolves whatever answered, writes
+ * NETSCAN_PATH. Own addresses are skipped (see nm_get_own_ipv4_addrs()) so
+ * this box never shows up as a discoverable network share of itself. Caller
+ * must hold g_netscan_mutex - this function touches the static result/
+ * DNS-cache buffers above and isn't safe to run concurrently with itself.
+ * Silently does nothing if the host count is out of range (0 or >
+ * NETSCAN_MAX_HOSTS, i.e. bigger than a /24). */
 static void nm_netscan_core(uint32_t network, uint32_t broadcast, const uint16_t *ports, int portCount)
 {
 	uint32_t hostCount = (broadcast > network + 1) ? (broadcast - network - 1) : 0;
 	if (hostCount == 0 || hostCount > NETSCAN_MAX_HOSTS)
 		return;
+
+	uint32_t ownIps[NM_MAX_OWN_IPS];
+	int ownIpCount = nm_get_own_ipv4_addrs(ownIps, NM_MAX_OWN_IPS);
 
 	static nm_scan_open_t openResults[NETSCAN_MAX_OPEN];
 	int openCount = 0;
@@ -2117,6 +2148,15 @@ static void nm_netscan_core(uint32_t network, uint32_t broadcast, const uint16_t
 	int slotCount = 0;
 
 	for (uint32_t h = network + 1; h < broadcast; h++) {
+		bool isOwn = false;
+		for (int oi = 0; oi < ownIpCount; oi++) {
+			if (ownIps[oi] == h) {
+				isOwn = true;
+				break;
+			}
+		}
+		if (isOwn)
+			continue;
 		for (int pi = 0; pi < portCount; pi++) {
 			if (slotCount == NETSCAN_BATCH) {
 				nm_scan_run_batch(slots, slotCount, openResults, &openCount, NETSCAN_MAX_OPEN);
