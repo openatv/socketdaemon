@@ -2321,6 +2321,39 @@ static int nm_get_ifindex_ipv4(unsigned int ifindex, uint32_t *outIp, int *outPr
  * loop is its actual job (LINK/IP/IFACE events, the daemon_net.socket
  * accept()) and must keep running regardless, so this never runs inline in
  * that thread - see nm_autoscan_thread() below, spawned once at startup. */
+/* Waits (polling every second, bounded) for /etc/resolv.conf to carry a
+ * usable "nameserver" line. On some boxes the DHCP client brings the
+ * interface's IPv4 address up - visible to nm_get_ifindex_ipv4() - before
+ * it has finished writing resolv.conf, so starting the scan right after
+ * "IP ready" can hit a still-empty/missing resolv.conf and silently skip
+ * every reverse-DNS hostname lookup in nm_dns_reverse_lookup() for this
+ * autoscan pass (a plain daemon restart later doesn't race this way since
+ * resolv.conf is already populated from the earlier boot). Bounded to
+ * NM_RESOLVCONF_WAIT_MAX_S so a network with no DNS configured (static IP,
+ * no nameserver) doesn't stall the autoscan. */
+#define NM_RESOLVCONF_WAIT_MAX_S 10
+static void nm_wait_for_resolvconf(void)
+{
+	for (int i = 0; i < NM_RESOLVCONF_WAIT_MAX_S && running; i++) {
+		FILE *f = fopen("/etc/resolv.conf", "r");
+		if (f) {
+			char line[256];
+			int found = 0;
+			while (fgets(line, sizeof(line), f)) {
+				char probe[64];
+				if (sscanf(line, "nameserver %63s", probe) == 1) {
+					found = 1;
+					break;
+				}
+			}
+			fclose(f);
+			if (found)
+				return;
+		}
+		sleep(1);
+	}
+}
+
 static void nm_run_autoscan(void)
 {
 	static const uint16_t ports[] = { 445, 2049 };
@@ -2336,6 +2369,10 @@ static void nm_run_autoscan(void)
 			break;
 		sleep(1);
 	}
+	if (!running)
+		return;
+
+	nm_wait_for_resolvconf();
 	if (!running)
 		return;
 
