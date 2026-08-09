@@ -1526,10 +1526,18 @@ int main(int argc, char **argv)
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGINT, &sa, NULL);
 
-	while ((c = getopt(argc, argv, "v")) != -1)
+	while ((c = getopt(argc, argv, "vl:")) != -1)
 	{
 		if (c == 'v')
 			verbose = 1;
+		else if (c == 'l')
+		{
+			FILE *lf = fopen(optarg, "a");
+			if (lf)
+				log_stream = lf;
+			else
+				fprintf(stderr, "cannot open log file %s: %s\n", optarg, strerror(errno));
+		}
 	}
 
 	if (unlink(CMD_SOCKET_NAME) == -1 && errno != ENOENT)
@@ -1958,6 +1966,17 @@ static int nm_looks_like_isp_wildcard(const char *name, uint32_t ip)
 	return strstr(name, forward) != NULL || strstr(name, reversed) != NULL;
 }
 
+/* Formats ip (host order) as dotted-quad for log messages. Static buffer -
+ * only safe under g_netscan_mutex, same as the DNS code that calls it. */
+static const char *ip_to_str(uint32_t ip)
+{
+	static char buf[INET_ADDRSTRLEN];
+	struct in_addr a;
+	a.s_addr = htonl(ip);
+	inet_ntop(AF_INET, &a, buf, sizeof(buf));
+	return buf;
+}
+
 /* Reverse-resolves ip (host order) to a hostname via a single PTR query to
  * the first nameserver in /etc/resolv.conf, bounded by DNS_TIMEOUT_MS.
  * Leaves out[0] = '\0' on any failure/timeout/missing resolv.conf. */
@@ -1979,14 +1998,20 @@ static void nm_dns_reverse_lookup(uint32_t ip, char *out, size_t outsz)
 	}
 	fclose(f);
 	if (!nsIp[0])
+	{
+		if (verbose) LOG("dns: no nameserver in /etc/resolv.conf\n");
 		return;
+	}
 
 	struct sockaddr_in ns;
 	memset(&ns, 0, sizeof(ns));
 	ns.sin_family = AF_INET;
 	ns.sin_port = htons(53);
 	if (inet_pton(AF_INET, nsIp, &ns.sin_addr) != 1)
+	{
+		if (verbose) LOG("dns: nameserver '%s' is not a valid IPv4 address, skipping\n", nsIp);
 		return;
+	}
 
 	unsigned char q[300];
 	int qlen = 0;
@@ -2015,8 +2040,12 @@ static void nm_dns_reverse_lookup(uint32_t ip, char *out, size_t outsz)
 
 	int fd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (fd < 0)
+	{
+		if (verbose) LOG("dns: socket: %s\n", strerror(errno));
 		return;
+	}
 	if (sendto(fd, q, qlen, 0, (struct sockaddr *)&ns, sizeof(ns)) < 0) {
+		if (verbose) LOG("dns: sendto %s: %s\n", nsIp, strerror(errno));
 		close(fd);
 		return;
 	}
@@ -2024,7 +2053,10 @@ static void nm_dns_reverse_lookup(uint32_t ip, char *out, size_t outsz)
 	struct pollfd pfd;
 	pfd.fd = fd;
 	pfd.events = POLLIN;
-	if (poll(&pfd, 1, DNS_TIMEOUT_MS) <= 0) {
+	int pr = poll(&pfd, 1, DNS_TIMEOUT_MS);
+	if (pr <= 0) {
+		if (verbose) LOG("dns: %s query to %s %s\n", ip_to_str(ip), nsIp,
+			pr == 0 ? "timed out" : strerror(errno));
 		close(fd);
 		return;
 	}
@@ -2033,13 +2065,20 @@ static void nm_dns_reverse_lookup(uint32_t ip, char *out, size_t outsz)
 	ssize_t rlen = recv(fd, resp, sizeof(resp), 0);
 	close(fd);
 	if (rlen < 12)
+	{
+		if (verbose) LOG("dns: %s recv too short (%zd bytes)\n", ip_to_str(ip), rlen);
 		return;
+	}
 
 	unsigned short rid = (unsigned short)((resp[0] << 8) | resp[1]);
 	int rcode = resp[3] & 0x0F;
 	int ancount = (resp[6] << 8) | resp[7];
 	if (rid != qid || rcode != 0 || ancount == 0)
+	{
+		if (verbose) LOG("dns: %s qid=%s rcode=%d ancount=%d\n", ip_to_str(ip),
+			rid != qid ? "mismatch" : "ok", rcode, ancount);
 		return;
+	}
 
 	char skip[DNS_NAME_MAX];
 	int pos = 12;
@@ -2062,11 +2101,16 @@ static void nm_dns_reverse_lookup(uint32_t ip, char *out, size_t outsz)
 			return;
 		if (type == 12) { /* PTR */
 			char name[DNS_NAME_MAX];
-			if (nm_dns_read_name(resp, (int)rlen, pos, name, sizeof(name)) > 0 &&
-			    !nm_looks_like_isp_wildcard(name, ip)) {
+			int nn = nm_dns_read_name(resp, (int)rlen, pos, name, sizeof(name));
+			if (nn > 0 && nm_looks_like_isp_wildcard(name, ip)) {
+				if (verbose) LOG("dns: %s PTR '%s' looks like ISP wildcard, discarding\n", ip_to_str(ip), name);
+			} else if (nn > 0) {
 				nm_sanitize_hostname(name);
 				strncpy(out, name, outsz - 1);
 				out[outsz - 1] = '\0';
+				if (verbose) LOG("dns: %s -> '%s'\n", ip_to_str(ip), out);
+			} else if (verbose) {
+				LOG("dns: %s PTR record present but name parse failed\n", ip_to_str(ip));
 			}
 			return;
 		}

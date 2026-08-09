@@ -6,7 +6,7 @@ fi
 
 case "$1" in
 	start)
-		start-stop-daemon -S -b -x /usr/bin/socketdaemon
+		start-stop-daemon -S -b -x /usr/bin/socketdaemon -- -v -l /tmp/socketdaemon.log
 		;;
 	stop)
 		start-stop-daemon -K -x /usr/bin/socketdaemon
