@@ -1807,11 +1807,12 @@ static int doResolve(const char *host)
  *     apart once at monitor_thread() startup, in that thread (so it never
  *     blocks the daemon.socket accept loop, which lives in main()).
  *
- * Non-blocking connect()+poll() in fixed-size batches keeps the scan
- * itself bounded by NETSCAN_TIMEOUT_MS per batch, not per host - a
- * dead/unused IP (no ARP reply, connect() would otherwise hang) costs no
- * more than any live one, so a full /24 across a handful of ports finishes
- * in low single-digit seconds worst case even against an all-dead subnet.
+ * Non-blocking connect()+poll() over a rate-paced sliding window (see
+ * NETSCAN_DISPATCH_US) keeps a dead/unused IP (no ARP reply, connect()
+ * would otherwise hang) from costing more than NETSCAN_TIMEOUT_MS, and
+ * caps the outgoing SYN rate so a full /24 doesn't look like a SYN flood
+ * to the LAN's own router/switch - a full /24 across a handful of ports
+ * finishes in low single-digit seconds even against an all-dead subnet.
  *
  * Each unique open host is additionally reverse-DNS-resolved (PTR query).
  * This is a minimal hand-rolled UDP DNS client, not getnameinfo()/
@@ -1827,8 +1828,21 @@ static int doResolve(const char *host)
 #define NETSCAN_TMP         "/var/run/netscan.tmp"
 #define NETSCAN_MAX_HOSTS   256   /* caller must chunk anything bigger than a /24 */
 #define NETSCAN_MAX_PORTS   8
-#define NETSCAN_BATCH       256   /* concurrent in-flight connects */
-#define NETSCAN_TIMEOUT_MS  400   /* per batch, not per host */
+#define NETSCAN_BATCH       128   /* concurrency cap: max simultaneously in-flight connects.
+                                    * Not the lever for pacing (see NETSCAN_DISPATCH_US) - just
+                                    * bounds the pfds[]/inflight[] arrays. Steady-state in-flight
+                                    * count is roughly dispatch-rate x NETSCAN_TIMEOUT_MS, so this
+                                    * just needs headroom above that. */
+#define NETSCAN_DISPATCH_US 8000  /* minimum gap between successive connect() dispatches, ~125/s.
+                                    * Firing the whole subnet's worth of SYNs back to back (even
+                                    * in modest-sized batches) was observed to make unrelated UDP
+                                    * traffic (a DNS query to the router) time out mid-scan - a
+                                    * home router's SYN-flood/rate-limit protection tripping and
+                                    * collaterally dropping this box's other traffic, not a local
+                                    * resource limit (fd/ARP counters stayed clean). Pacing the
+                                    * outgoing rate instead of just capping concurrency is what
+                                    * actually avoids that. */
+#define NETSCAN_TIMEOUT_MS  400   /* per slot, measured from its own dispatch time */
 #define NETSCAN_MAX_OPEN    256   /* result buffer cap */
 #define DNS_TIMEOUT_MS      300   /* per host, reverse PTR lookup */
 #define DNS_NAME_MAX        256
@@ -1836,66 +1850,43 @@ static int doResolve(const char *host)
 typedef struct {
 	uint32_t ip;   /* host order */
 	uint16_t port;
-	int fd;
-} nm_scan_slot_t;
+} nm_scan_open_t;
 
 typedef struct {
 	uint32_t ip;   /* host order */
 	uint16_t port;
-} nm_scan_open_t;
-
-/* Polls up to n in-flight non-blocking connects to completion or
- * NETSCAN_TIMEOUT_MS, whichever comes first; appends successes to
- * open[]/*openCount and closes every fd before returning. */
-static void nm_scan_run_batch(nm_scan_slot_t *slots, int n,
-	nm_scan_open_t *open, int *openCount, int openMax)
-{
-	struct pollfd pfds[NETSCAN_BATCH];
-	for (int i = 0; i < n; i++) {
-		pfds[i].fd = slots[i].fd;
-		pfds[i].events = POLLOUT;
-		pfds[i].revents = 0;
-	}
-
+	int fd;
 	struct timespec deadline;
-	clock_gettime(CLOCK_MONOTONIC, &deadline);
-	deadline.tv_sec += NETSCAN_TIMEOUT_MS / 1000;
-	deadline.tv_nsec += (long)(NETSCAN_TIMEOUT_MS % 1000) * 1000000L;
-	if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+} nm_scan_inflight_t;
 
-	int remaining = n;
-	while (remaining > 0) {
-		struct timespec now;
-		clock_gettime(CLOCK_MONOTONIC, &now);
-		long remainMs = (deadline.tv_sec - now.tv_sec) * 1000 +
-			(deadline.tv_nsec - now.tv_nsec) / 1000000L;
-		if (remainMs <= 0)
-			break;
+/* Diagnostic counters for a full nm_netscan_core() run, logged only when
+ * verbose - lets a scan that comes back with far fewer open hosts than
+ * expected (see netscan-only-finds-one-host reports) be told apart from a
+ * genuinely quiet network: socketFail/connectImmediateFail happen before a
+ * slot is ever queued (fd exhaustion, routing), while connectRefused/
+ * pollTimeout happen after (host actively refused vs. never answered before
+ * its own NETSCAN_TIMEOUT_MS deadline). */
+typedef struct {
+	int socketFail;            /* socket() < 0 */
+	int connectImmediateFail;  /* connect() failed synchronously, not EINPROGRESS */
+	int connectRefused;        /* connect() completed with SO_ERROR != 0 */
+	int pollTimeout;           /* slot never got a poll revent before its own deadline */
+} nm_scan_stats_t;
 
-		if (poll(pfds, n, (int)remainMs) <= 0)
-			break;
+/* a < b -> negative, a == b -> 0, a > b -> positive. */
+static long nm_ts_cmp(struct timespec a, struct timespec b)
+{
+	if (a.tv_sec != b.tv_sec)
+		return a.tv_sec - b.tv_sec;
+	return a.tv_nsec - b.tv_nsec;
+}
 
-		for (int i = 0; i < n; i++) {
-			if (pfds[i].fd < 0 || pfds[i].revents == 0)
-				continue;
-			int err = 0;
-			socklen_t elen = sizeof(err);
-			getsockopt(pfds[i].fd, SOL_SOCKET, SO_ERROR, &err, &elen);
-			if (err == 0 && *openCount < openMax) {
-				open[*openCount].ip = slots[i].ip;
-				open[*openCount].port = slots[i].port;
-				(*openCount)++;
-			}
-			close(pfds[i].fd);
-			pfds[i].fd = -1;
-			remaining--;
-		}
-	}
-
-	for (int i = 0; i < n; i++) {
-		if (pfds[i].fd >= 0)
-			close(pfds[i].fd);
-	}
+static struct timespec nm_ts_add_ms(struct timespec t, long ms)
+{
+	t.tv_sec += ms / 1000;
+	t.tv_nsec += (ms % 1000) * 1000000L;
+	if (t.tv_nsec >= 1000000000L) { t.tv_sec++; t.tv_nsec -= 1000000000L; }
+	return t;
 }
 
 /* Decodes a (possibly compressed) DNS name starting at pkt[offset] into
@@ -2182,67 +2173,164 @@ static void nm_netscan_core(uint32_t network, uint32_t broadcast, const uint16_t
 	if (hostCount == 0 || hostCount > NETSCAN_MAX_HOSTS)
 		return;
 
+	struct timespec scanStart;
+	clock_gettime(CLOCK_MONOTONIC, &scanStart);
+
 	uint32_t ownIps[NM_MAX_OWN_IPS];
 	int ownIpCount = nm_get_own_ipv4_addrs(ownIps, NM_MAX_OWN_IPS);
 
 	static nm_scan_open_t openResults[NETSCAN_MAX_OPEN];
 	int openCount = 0;
+	nm_scan_stats_t stats = {0};
 
-	nm_scan_slot_t slots[NETSCAN_BATCH];
-	int slotCount = 0;
+	nm_scan_inflight_t inflight[NETSCAN_BATCH];
+	int inflightCount = 0;
 
-	for (uint32_t h = network + 1; h < broadcast; h++) {
-		bool isOwn = false;
-		for (int oi = 0; oi < ownIpCount; oi++) {
-			if (ownIps[oi] == h) {
-				isOwn = true;
+	uint32_t curHost = network + 1;
+	int curPort = 0;
+	bool exhausted = false;
+
+	struct timespec nextDispatch;
+	clock_gettime(CLOCK_MONOTONIC, &nextDispatch);   /* first dispatch is immediate */
+
+	while (!exhausted || inflightCount > 0) {
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+
+		/* Paced dispatch: at most one new connect per loop iteration, no
+		 * sooner than NETSCAN_DISPATCH_US after the previous one, and only
+		 * while there's concurrency headroom. */
+		if (!exhausted && inflightCount < NETSCAN_BATCH && nm_ts_cmp(now, nextDispatch) >= 0) {
+			uint32_t h = 0;
+			int pi = 0;
+			bool got = false;
+			while (curHost < broadcast) {
+				bool isOwn = false;
+				for (int oi = 0; oi < ownIpCount; oi++) {
+					if (ownIps[oi] == curHost) { isOwn = true; break; }
+				}
+				if (isOwn || curPort >= portCount) {
+					curHost++;
+					curPort = 0;
+					continue;
+				}
+				h = curHost;
+				pi = curPort;
+				curPort++;
+				got = true;
 				break;
 			}
-		}
-		if (isOwn)
-			continue;
-		for (int pi = 0; pi < portCount; pi++) {
-			if (slotCount == NETSCAN_BATCH) {
-				nm_scan_run_batch(slots, slotCount, openResults, &openCount, NETSCAN_MAX_OPEN);
-				slotCount = 0;
-			}
+			if (!got) {
+				exhausted = true;
+			} else {
+				int fd = socket(AF_INET, SOCK_STREAM, 0);
+				if (fd < 0) {
+					stats.socketFail++;
+				} else {
+					int flags = fcntl(fd, F_GETFL, 0);
+					fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
-			int fd = socket(AF_INET, SOCK_STREAM, 0);
-			if (fd < 0)
-				continue;
-			int flags = fcntl(fd, F_GETFL, 0);
-			fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+					struct sockaddr_in dst;
+					memset(&dst, 0, sizeof(dst));
+					dst.sin_family = AF_INET;
+					dst.sin_port = htons(ports[pi]);
+					dst.sin_addr.s_addr = htonl(h);
 
-			struct sockaddr_in dst;
-			memset(&dst, 0, sizeof(dst));
-			dst.sin_family = AF_INET;
-			dst.sin_port = htons(ports[pi]);
-			dst.sin_addr.s_addr = htonl(h);
-
-			int cr = connect(fd, (struct sockaddr *)&dst, sizeof(dst));
-			if (cr == 0) {
-				/* connected instantly (rare, e.g. same box) */
-				if (openCount < NETSCAN_MAX_OPEN) {
-					openResults[openCount].ip = h;
-					openResults[openCount].port = ports[pi];
-					openCount++;
+					int cr = connect(fd, (struct sockaddr *)&dst, sizeof(dst));
+					if (cr == 0) {
+						/* connected instantly (rare, e.g. same box) */
+						if (openCount < NETSCAN_MAX_OPEN) {
+							openResults[openCount].ip = h;
+							openResults[openCount].port = ports[pi];
+							openCount++;
+						}
+						close(fd);
+					} else if (errno != EINPROGRESS) {
+						stats.connectImmediateFail++;
+						close(fd);
+					} else {
+						nm_scan_inflight_t *slot = &inflight[inflightCount++];
+						slot->ip = h;
+						slot->port = ports[pi];
+						slot->fd = fd;
+						slot->deadline = nm_ts_add_ms(now, NETSCAN_TIMEOUT_MS);
+					}
 				}
-				close(fd);
-				continue;
+				nextDispatch = nm_ts_add_ms(now, NETSCAN_DISPATCH_US / 1000);
 			}
-			if (errno != EINPROGRESS) {
-				close(fd);
-				continue;
-			}
+		}
 
-			slots[slotCount].ip = h;
-			slots[slotCount].port = ports[pi];
-			slots[slotCount].fd = fd;
-			slotCount++;
+		if (exhausted && inflightCount == 0)
+			break;
+
+		/* Wake up either for the next scheduled dispatch or for the
+		 * earliest in-flight deadline, whichever comes first. */
+		bool haveWake = false;
+		struct timespec wake = now;
+		if (!exhausted && inflightCount < NETSCAN_BATCH) {
+			wake = nextDispatch;
+			haveWake = true;
+		}
+		for (int i = 0; i < inflightCount; i++) {
+			if (!haveWake || nm_ts_cmp(inflight[i].deadline, wake) < 0) {
+				wake = inflight[i].deadline;
+				haveWake = true;
+			}
+		}
+		long waitMs = 0;
+		if (haveWake) {
+			waitMs = (wake.tv_sec - now.tv_sec) * 1000 + (wake.tv_nsec - now.tv_nsec) / 1000000L;
+			if (waitMs < 0)
+				waitMs = 0;
+		}
+
+		if (inflightCount > 0) {
+			struct pollfd pfds[NETSCAN_BATCH];
+			for (int i = 0; i < inflightCount; i++) {
+				pfds[i].fd = inflight[i].fd;
+				pfds[i].events = POLLOUT;
+				pfds[i].revents = 0;
+			}
+			if (poll(pfds, inflightCount, (int)waitMs) > 0) {
+				/* Iterate back-to-front: swap-remove only ever pulls from an
+				 * index we've already visited (or ourselves), so pfds[j] for
+				 * the not-yet-visited j < i always still matches inflight[j]
+				 * as it was when poll() was called - going forward would let
+				 * a swapped-in element inherit a stale, already-closed fd's
+				 * pfds[] slot at the reused index. */
+				for (int i = inflightCount - 1; i >= 0; i--) {
+					if (pfds[i].revents == 0)
+						continue;
+					int err = 0;
+					socklen_t elen = sizeof(err);
+					getsockopt(pfds[i].fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+					if (err == 0 && openCount < NETSCAN_MAX_OPEN) {
+						openResults[openCount].ip = inflight[i].ip;
+						openResults[openCount].port = inflight[i].port;
+						openCount++;
+					} else if (err != 0) {
+						stats.connectRefused++;
+					}
+					close(inflight[i].fd);
+					inflight[i] = inflight[--inflightCount];
+				}
+			}
+		} else if (waitMs > 0) {
+			struct timespec req = { waitMs / 1000, (waitMs % 1000) * 1000000L };
+			nanosleep(&req, NULL);
+		}
+
+		/* Reap anything that hit its own deadline regardless of what poll()
+		 * returned (it only reports readiness, not who's overdue). */
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		for (int i = inflightCount - 1; i >= 0; i--) {
+			if (nm_ts_cmp(now, inflight[i].deadline) >= 0) {
+				stats.pollTimeout++;
+				close(inflight[i].fd);
+				inflight[i] = inflight[--inflightCount];
+			}
 		}
 	}
-	if (slotCount > 0)
-		nm_scan_run_batch(slots, slotCount, openResults, &openCount, NETSCAN_MAX_OPEN);
 
 	static char buf[8192];
 	int off = 0;
@@ -2267,8 +2355,17 @@ static void nm_netscan_core(uint32_t network, uint32_t broadcast, const uint16_t
 	fputs(buf, out);
 	fclose(out);
 	rename(NETSCAN_TMP, NETSCAN_PATH);
-	if (verbose)
-		LOG("netscan: wrote %s (%d open of %u scanned)\n", NETSCAN_PATH, openCount, hostCount);
+	if (verbose) {
+		struct timespec scanEnd;
+		clock_gettime(CLOCK_MONOTONIC, &scanEnd);
+		long elapsedMs = (scanEnd.tv_sec - scanStart.tv_sec) * 1000 +
+			(scanEnd.tv_nsec - scanStart.tv_nsec) / 1000000L;
+		LOG("netscan: wrote %s (%d open of %u scanned) in %ldms "
+			"[socketFail=%d connectImmediateFail=%d connectRefused=%d pollTimeout=%d]\n",
+			NETSCAN_PATH, openCount, hostCount, elapsedMs,
+			stats.socketFail, stats.connectImmediateFail, stats.connectRefused,
+			stats.pollTimeout);
+	}
 }
 
 /* Parses "a.b.c.d/prefix,port[,port...]" and runs nm_netscan_core(). Caller
