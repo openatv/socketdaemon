@@ -1316,6 +1316,25 @@ static int nm_handle_rtnetlink(int nls, char *evtbuf, int evtmax)
 			off = nm_evt(evtbuf, off, evtmax, "IP,%s,%s/%d\n",
 				ifname, ipbuf, ifa->ifa_prefixlen);
 		}
+		else if (nlh->nlmsg_type == RTM_NEWROUTE || nlh->nlmsg_type == RTM_DELROUTE) {
+			struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(nlh);
+			if (rtm->rtm_family != AF_INET || rtm->rtm_dst_len != 0) continue; /* only default-route changes affect gw reporting */
+
+			struct rtattr *rta = RTM_RTA(rtm);
+			int rtl = (int)RTM_PAYLOAD(nlh);
+			unsigned int oif = 0;
+			for (; RTA_OK(rta, rtl); rta = RTA_NEXT(rta, rtl)) {
+				if (rta->rta_type == RTA_OIF) { oif = *(unsigned int *)RTA_DATA(rta); break; }
+			}
+
+			char ifname[IFNAMSIZ] = {0};
+			if (oif) if_indextoname(oif, ifname);
+			if (!ifname[0] || strcmp(ifname, "lo") == 0) continue;
+
+			if (verbose) LOG("netmon: RTM_%sROUTE default via %s\n",
+				nlh->nlmsg_type == RTM_NEWROUTE ? "NEW" : "DEL", ifname);
+			off = nm_evt(evtbuf, off, evtmax, "ROUTE,%s\n", ifname);
+		}
 	}
 	return off;
 }
@@ -1389,12 +1408,15 @@ static void *monitor_thread(void *arg)
 
 	if (verbose) LOG("netmon: thread started\n");
 
-	/* NETLINK_ROUTE: link-state and IP-address events */
+	/* NETLINK_ROUTE: link-state, IP-address and default-route events.
+	 * RTMGRP_IPV4_ROUTE is needed so a default-route add (e.g. DHCP adding
+	 * the route slightly after the address) triggers an immediate refresh
+	 * instead of waiting for the POLL_INTERVAL_SEC fallback. */
 	nls = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
 	if (nls < 0) { LOG("netmon: netlink socket: %s\n", strerror(errno)); goto out; }
 	memset(&sa, 0, sizeof(sa));
 	sa.nl_family = AF_NETLINK;
-	sa.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
+	sa.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR | RTMGRP_IPV4_ROUTE;
 	if (bind(nls, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
 		LOG("netmon: netlink bind: %s\n", strerror(errno)); goto out;
 	}
