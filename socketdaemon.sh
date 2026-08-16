@@ -6,7 +6,11 @@ fi
 
 case "$1" in
 	start)
-		start-stop-daemon -S -b -x /usr/bin/socketdaemon -- -v -l /tmp/socketdaemon.log
+		if grep -q "^config.crash.debugNetwork=True$" /etc/enigma2/settings 2>/dev/null; then
+			start-stop-daemon -S -b -x /usr/bin/socketdaemon -- -v -l /var/log/socketdaemon.log
+		else
+			start-stop-daemon -S -b -x /usr/bin/socketdaemon
+		fi
 		;;
 	stop)
 		start-stop-daemon -K -x /usr/bin/socketdaemon
