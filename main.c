@@ -17,7 +17,7 @@
  *   NETRESTART                → netrestarter restart all
  *   NETRESTART,<iface>        → netrestarter restart <iface>
  *                               (iface: eth0, wlan0, wlan1, …)
- *   PING,<iface>,<host>       → one ICMP echo bound to <iface>, 2s timeout
+ *   PING,<iface>,<host>       → one ICMP echo sent through <iface>, 2s timeout
  *                               (exitcode 0 = reply received, 1 = no reply)
  *   RESOLVE,<host>            → resolve <host> via getaddrinfo (AF_INET)
  *                               (exitcode 0 = resolved, 1 = failed)
@@ -28,7 +28,8 @@
  *                               (exitcode 0 = scan completed, 1 = bad params).
  *                               Blocks the caller for the scan's duration
  *                               (bounded, see NETSCAN block below) - same
- *                               blocking-per-command model as PING above.
+ *                               per-request thread as PING and RESOLVE, so
+ *                               other clients are not held up.
  *
  * In addition to on-demand NETSCAN, the daemon runs its own unattended
  * discovery scan once at startup (SMB/NFS ports 445+2049 against the
@@ -53,6 +54,9 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <linux/if_addr.h>
+#include <linux/if_ether.h>
+#include <linux/if_packet.h>
+#include <linux/filter.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -164,9 +168,9 @@ static int g_stop_pipe[2] = {-1, -1};
 
 /* Serializes access to the netscan machinery's static scan/DNS-cache
  * buffers (see NETSCAN block below) between two independent callers that
- * run on different threads: CMD_NETSCAN (processMessage(), on the main
- * accept-loop thread) and nm_run_autoscan() (on its own thread, spawned
- * once by monitor_thread() at startup). */
+ * run on different threads: CMD_NETSCAN (processMessage(), on a probe
+ * thread) and nm_run_autoscan() (on its own thread, spawned once by
+ * monitor_thread() at startup). */
 static pthread_mutex_t g_netscan_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int processMessage(char *inData);
@@ -1531,6 +1535,71 @@ out:
 	return NULL;
 }
 
+/* Probes block for their whole timeout, so they must not hold up the accept loop:
+ * each runs on a detached thread that owns the client socket until it replies. */
+struct probeRequest
+{
+	int fd;
+	unsigned long reqId;
+	char msg[300];
+};
+
+static int isProbeAction(const char *type)
+{
+	return strcmp(type, CMD_PING) == 0 || strcmp(type, CMD_RESOLVE) == 0 || strcmp(type, CMD_NETSCAN) == 0;
+}
+
+static int exitCodeOf(int rc)
+{
+	if (rc < 0)
+		return 127;
+	if (WIFEXITED(rc))
+		return WEXITSTATUS(rc);
+	return 1;
+}
+
+static void *probeThread(void *arg)
+{
+	struct probeRequest *req = arg;
+	int exitcode = exitCodeOf(processMessage(req->msg));
+	char reply[64];
+	snprintf(reply, sizeof(reply),
+	         exitcode == 0 ? "DONE %lu %d\n" : "ERROR %lu %d\n",
+	         req->reqId, exitcode);
+	ssize_t wr = send(req->fd, reply, strlen(reply), MSG_NOSIGNAL);
+	if (verbose)
+		LOG("write %s --> %zd\n", reply, wr);
+	close(req->fd);
+	free(req);
+	return NULL;
+}
+
+/* Returns 1 when the request was handed over to a thread, which then owns fd. */
+static int startProbeThread(int fd, unsigned long reqId, const char *msg)
+{
+	struct probeRequest *req = malloc(sizeof(*req));
+	if (!req)
+		return 0;
+	req->fd = fd;
+	req->reqId = reqId;
+	strncpy(req->msg, msg, sizeof(req->msg) - 1);
+	req->msg[sizeof(req->msg) - 1] = '\0';
+
+	pthread_t tid;
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	int rc = pthread_create(&tid, &attr, probeThread, req);
+	pthread_attr_destroy(&attr);
+	if (rc != 0)
+	{
+		LOG("probe: pthread_create failed: %s\n", strerror(rc));
+		free(req);
+		return 0;
+	}
+	return 1;
+}
+
 int main(int argc, char **argv)
 {
 
@@ -1604,6 +1673,7 @@ int main(int argc, char **argv)
 		}
 		else
 		{
+			int handedOff = 0;
 			do
 			{
 				memset(buf, 0, sizeof(buf));
@@ -1644,14 +1714,12 @@ int main(int argc, char **argv)
 								snprintf(msg, sizeof(msg), "%s,%s", ntype, p);
 							else
 								strncpy(msg, ntype, sizeof(msg) - 1);
-							int rc = processMessage(msg);
-							int exitcode;
-							if (rc < 0)
-								exitcode = 127;
-							else if (WIFEXITED(rc))
-								exitcode = WEXITSTATUS(rc);
-							else
-								exitcode = 1;
+							if (isProbeAction(ntype) && startProbeThread(msgsock, reqId, msg))
+							{
+								handedOff = 1;
+								break;
+							}
+							int exitcode = exitCodeOf(processMessage(msg));
 							char reply[64];
 							snprintf(reply, sizeof(reply),
 							         exitcode == 0 ? "DONE %lu %d\n" : "ERROR %lu %d\n",
@@ -1663,15 +1731,8 @@ int main(int argc, char **argv)
 						else
 						{
 							/* Legacy null-terminated protocol: "COMMAND,data\0" → "RC:<n>" */
-							int rc = processMessage(buf);
+							int exitcode = exitCodeOf(processMessage(buf));
 							char reply[16];
-							int exitcode;
-							if (rc < 0)
-								exitcode = 127;
-							else if (WIFEXITED(rc))
-								exitcode = WEXITSTATUS(rc);
-							else
-								exitcode = 1;
 							snprintf(reply, sizeof(reply), "RC:%d", exitcode);
 							ssize_t wr = send(msgsock, reply, strlen(reply), MSG_NOSIGNAL);
 							if (verbose)
@@ -1680,7 +1741,8 @@ int main(int argc, char **argv)
 					}
 				}
 			} while (rval > 0);
-			close(msgsock);
+			if (!handedOff)
+				close(msgsock);
 		}
 	}
 	close(sock);
@@ -1711,11 +1773,50 @@ static unsigned short icmpChecksum(const void *buf, int len)
 	return (unsigned short)~sum;
 }
 
-/* One ICMP echo request bound to iface, waits up to timeoutMs for a matching
+/* One ICMP echo request sent through iface, waits up to timeoutMs for a matching
  * reply. Returns 0 if a reply was received, 1 otherwise. host may be a
- * dotted-quad or a hostname (resolved via getaddrinfo). */
+ * dotted-quad or a hostname (resolved via getaddrinfo).
+ *
+ * Only the sending socket is bound to iface. When another interface holds an
+ * address in the same subnet, the peer's ARP entry for our address can point at
+ * that sibling interface, so the reply arrives there; a receiving socket bound
+ * to iface would never see it and every ping would time out. The request itself
+ * still leaves through iface, which is what is being tested here. Id and
+ * sequence number make the reply unambiguous. */
+/* Socket for the echo reply. AF_PACKET sees the frame before the routing code
+ * does, which an IP socket does not: with rp_filter strict (the default here) a
+ * reply that arrives on a sibling interface is discarded when the kernel's best
+ * route back to the host points at yet another one. Only ICMP is passed up, the
+ * rest of the box's traffic is dropped in the kernel. SOCK_DGRAM strips the link
+ * layer, so the payload starts at the IP header, same as on a raw IP socket. */
+static int openReplySocket(void)
+{
+	static struct sock_filter icmpOnly[] = {
+		BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 9),  /* Protocol field of the IP header. */
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IPPROTO_ICMP, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, 0xFFFF),
+		BPF_STMT(BPF_RET | BPF_K, 0),
+	};
+	static struct sock_fprog prog = {
+		.len = sizeof(icmpOnly) / sizeof(icmpOnly[0]),
+		.filter = icmpOnly,
+	};
+
+	int sock = socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
+	if (sock >= 0) {
+		if (setsockopt(sock, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof(prog)) == 0)
+			return sock;
+		close(sock);  /* Without the filter every IP packet would come up here. */
+	}
+	if (verbose)
+		LOG("ping: no packet socket (%s), falling back to a raw socket\n", strerror(errno));
+	return socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+}
+
 static int doPing(const char *iface, const char *host, int timeoutMs)
 {
+	static unsigned int pingSeq = 0;  /* Shared by the probe threads. */
+
 	struct addrinfo hints, *res = NULL;
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_INET;
@@ -1725,19 +1826,27 @@ static int doPing(const char *iface, const char *host, int timeoutMs)
 	struct sockaddr_in dst = *(struct sockaddr_in *)res->ai_addr;
 	freeaddrinfo(res);
 
-	int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	int sock = openReplySocket();
 	if (sock < 0)
 		return 1;
+
+	int txSock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	if (txSock < 0) {
+		close(sock);
+		return 1;
+	}
 
 	struct ifreq ifr;
 	memset(&ifr, 0, sizeof(ifr));
 	strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
-	if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) < 0) {
+	if (setsockopt(txSock, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) < 0) {
+		close(txSock);
 		close(sock);
 		return 1;
 	}
 
 	unsigned short pid = (unsigned short)(getpid() & 0xFFFF);
+	unsigned short seq = (unsigned short)__sync_add_and_fetch(&pingSeq, 1);
 	struct __attribute__((packed)) {
 		unsigned char type, code;
 		unsigned short checksum, id, seq;
@@ -1747,12 +1856,13 @@ static int doPing(const char *iface, const char *host, int timeoutMs)
 	pkt.code = 0;
 	pkt.checksum = 0;
 	pkt.id = htons(pid);
-	pkt.seq = htons(1);
+	pkt.seq = htons(seq);
 	memcpy(pkt.payload, "e2net", 5);
 	pkt.checksum = icmpChecksum(&pkt, sizeof(pkt));
 
 	dst.sin_port = 0;
-	if (sendto(sock, &pkt, sizeof(pkt), 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+	if (sendto(txSock, &pkt, sizeof(pkt), 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+		close(txSock);
 		close(sock);
 		return 1;
 	}
@@ -1786,14 +1896,17 @@ static int doPing(const char *iface, const char *host, int timeoutMs)
 		if (n < ihl + 8)
 			continue;
 		unsigned char rtype = buf[ihl];
-		unsigned short rid;
+		unsigned short rid, rseq;
 		memcpy(&rid, buf + ihl + 4, 2);
+		memcpy(&rseq, buf + ihl + 6, 2);
 		rid = ntohs(rid);
-		if (rtype == 0 && rid == pid) {
+		rseq = ntohs(rseq);
+		if (rtype == 0 && rid == pid && rseq == seq) {
 			result = 0;
 			break;
 		}
 	}
+	close(txSock);
 	close(sock);
 	return result;
 }
@@ -1822,9 +1935,9 @@ static int doResolve(const char *host)
  * above) since they'd otherwise race on the static result/DNS-cache
  * buffers below:
  *   - CMD_NETSCAN (processMessage() below) - caller-specified range/ports,
- *     runs synchronously like every other command in this file (blocks the
- *     requesting client for the scan's duration, same as doPing()'s 2s
- *     block - fine since the scan itself is bounded, see below).
+ *     runs on its own probe thread (see probeThread() in main.c), so it
+ *     blocks only the requesting client for the scan's duration, same as
+ *     doPing()'s 2s block - fine since the scan itself is bounded, see below.
  *   - nm_run_autoscan() - unattended, fixed SMB/NFS ports, run twice 3s
  *     apart once at monitor_thread() startup, in that thread (so it never
  *     blocks the daemon.socket accept loop, which lives in main()).
