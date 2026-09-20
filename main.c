@@ -353,6 +353,102 @@ static int nm_get_wlan_bssid(int sock, const char *iface, char *out, size_t outs
 	return 1;
 }
 
+/* Last answer per interface, so an unchanged association costs no round trip */
+static struct {
+	char iface[IFNAMSIZ];
+	char bssid[18];
+	char ssid[NM_IW_ESSID_MAX + 1];
+	char keyMgmt[64];
+	char pairwise[64];
+	int used;
+} g_wpaCache[8];
+
+/* What the association settled on, from one STATUS; empty without wpa_supplicant */
+static void nm_get_wpa_status(const char *iface, char *keyMgmt, size_t keyMgmtSize, char *pairwise, size_t pairwiseSize)
+{
+	keyMgmt[0] = '\0';
+	pairwise[0] = '\0';
+
+	struct sockaddr_un dst;
+	memset(&dst, 0, sizeof(dst));
+	dst.sun_family = AF_UNIX;
+	snprintf(dst.sun_path, sizeof(dst.sun_path), "/var/run/wpa_supplicant/%s", iface);
+
+	int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+	if (sock < 0)
+		return;
+
+	struct sockaddr_un own;
+	memset(&own, 0, sizeof(own));
+	own.sun_family = AF_UNIX;
+	snprintf(own.sun_path, sizeof(own.sun_path), "/tmp/socketdaemon-wpa-%d-%lu-%s",
+	         (int)getpid(), (unsigned long)pthread_self(), iface);
+	unlink(own.sun_path);
+	if (bind(sock, (struct sockaddr *)&own, sizeof(own)) == 0 &&
+	    connect(sock, (struct sockaddr *)&dst, sizeof(dst)) == 0) {
+		struct timeval tv = { 0, 300000 };
+		setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+		setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+		char reply[2048];
+		ssize_t n;
+		if (send(sock, "STATUS", 6, 0) == 6 && (n = recv(sock, reply, sizeof(reply) - 1, 0)) > 0) {
+			reply[n] = '\0';
+			for (char *line = reply; line && *line; ) {
+				char *nl = strchr(line, '\n');
+				if (nl)
+					*nl = '\0';
+				if (strncmp(line, "key_mgmt=", 9) == 0)
+					snprintf(keyMgmt, keyMgmtSize, "%s", line + 9);
+				else if (strncmp(line, "pairwise_cipher=", 16) == 0)
+					snprintf(pairwise, pairwiseSize, "%s", line + 16);
+				line = nl ? nl + 1 : NULL;
+			}
+		}
+	}
+	close(sock);
+	unlink(own.sun_path);
+}
+
+/* Entries untouched during a round belong to interfaces that are gone or idle */
+static void nm_wpa_cache_round(int start)
+{
+	for (size_t i = 0; i < sizeof(g_wpaCache) / sizeof(g_wpaCache[0]); i++) {
+		if (start)
+			g_wpaCache[i].used = 0;
+		else if (!g_wpaCache[i].used)
+			memset(&g_wpaCache[i], 0, sizeof(g_wpaCache[i]));
+	}
+}
+
+/* Asks wpa_supplicant only when the association changed, cached answer otherwise */
+static void nm_get_wpa_status_cached(const char *iface, const char *bssid, const char *ssid,
+                                     char *keyMgmt, size_t keyMgmtSize, char *pairwise, size_t pairwiseSize)
+{
+	size_t slot = 0;
+	while (slot < sizeof(g_wpaCache) / sizeof(g_wpaCache[0]) && g_wpaCache[slot].iface[0] &&
+	       strcmp(g_wpaCache[slot].iface, iface) != 0)
+		slot++;
+	if (slot >= sizeof(g_wpaCache) / sizeof(g_wpaCache[0])) {  /* More interfaces than slots, ask every time. */
+		nm_get_wpa_status(iface, keyMgmt, keyMgmtSize, pairwise, pairwiseSize);
+		return;
+	}
+
+	g_wpaCache[slot].used = 1;
+	if (g_wpaCache[slot].iface[0] && strcmp(g_wpaCache[slot].bssid, bssid) == 0 &&
+	    strcmp(g_wpaCache[slot].ssid, ssid) == 0) {
+		snprintf(keyMgmt, keyMgmtSize, "%s", g_wpaCache[slot].keyMgmt);
+		snprintf(pairwise, pairwiseSize, "%s", g_wpaCache[slot].pairwise);
+		return;
+	}
+
+	nm_get_wpa_status(iface, keyMgmt, keyMgmtSize, pairwise, pairwiseSize);
+	snprintf(g_wpaCache[slot].iface, sizeof(g_wpaCache[slot].iface), "%s", iface);
+	snprintf(g_wpaCache[slot].bssid, sizeof(g_wpaCache[slot].bssid), "%s", bssid);
+	snprintf(g_wpaCache[slot].ssid, sizeof(g_wpaCache[slot].ssid), "%s", ssid);
+	snprintf(g_wpaCache[slot].keyMgmt, sizeof(g_wpaCache[slot].keyMgmt), "%s", keyMgmt);
+	snprintf(g_wpaCache[slot].pairwise, sizeof(g_wpaCache[slot].pairwise), "%s", pairwise);
+}
+
 /* Frequency in MHz via SIOCGIWFREQ; returns 0 when not available */
 static int nm_get_wlan_freq_mhz(int sock, const char *iface)
 {
@@ -904,6 +1000,7 @@ static int nm_gather_and_write(int force)
 	else
 		strncpy(timebuf, "1970-01-01T00:00:00Z", sizeof(timebuf) - 1);
 
+	nm_wpa_cache_round(1);
 	sock = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sock < 0) {
 		LOG("netmon: socket: %s\n", strerror(errno));
@@ -1121,6 +1218,16 @@ static int nm_gather_and_write(int force)
 			if (sig != 0)
 				off += snprintf(buf + off, sizeof(buf) - off,
 					",\n      \"signal_dbm\": %d", sig);
+			if (if_running) {
+				char keyMgmt[64] = {}, pairwise[64] = {};
+				nm_get_wpa_status_cached(iface, bssidbuf, ssid, keyMgmt, sizeof(keyMgmt), pairwise, sizeof(pairwise));
+				if (keyMgmt[0])
+					off += snprintf(buf + off, sizeof(buf) - off,
+						",\n      \"key_mgmt\": \"%s\"", keyMgmt);
+				if (pairwise[0])
+					off += snprintf(buf + off, sizeof(buf) - off,
+						",\n      \"pairwise_cipher\": \"%s\"", pairwise);
+			}
 			if (verbose)
 				LOG("netmon:   wlan link=%d ssid='%s' bssid=%s freq=%d ch=%d rate=%d sig=%d\n",
 					if_running, ssid, bssidbuf,
@@ -1180,6 +1287,7 @@ static int nm_gather_and_write(int force)
 	}
 	fclose(pf);
 	close(sock);
+	nm_wpa_cache_round(0);
 
 	off += snprintf(buf + off, sizeof(buf) - off, "\n  }\n}\n");
 
