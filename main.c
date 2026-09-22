@@ -128,7 +128,14 @@
 #define NM_IW_QUAL_DBM   0x08
 
 struct nm_iw_quality { uint8_t qual, level, noise, updated; };
-struct nm_iw_stats   { uint16_t status; struct nm_iw_quality qual; };
+/* Same layout as struct iw_statistics: the kernel always writes the counters
+ * behind the quality back, a shorter buffer makes the ioctl useless. */
+struct nm_iw_stats   {
+	uint16_t status;
+	struct nm_iw_quality qual;
+	struct { uint32_t nwid, code, fragment, retries, misc; } discard;
+	struct { uint32_t beacon; } miss;
+};
 struct nm_iw_point   { void *pointer; uint16_t length, flags; };
 union  nm_iwreq_data {
 	char name[IFNAMSIZ];
@@ -449,6 +456,15 @@ static void nm_get_wpa_status_cached(const char *iface, const char *bssid, const
 	snprintf(g_wpaCache[slot].pairwise, sizeof(g_wpaCache[slot].pairwise), "%s", pairwise);
 }
 
+/* Frequency in MHz from a 2.4 or 5 GHz channel number; returns 0 for others */
+static int nm_channel_to_freq_mhz(int channel)
+{
+	if (channel == 14) return 2484;
+	if (channel >= 1 && channel <= 13) return 2407 + channel * 5;
+	if (channel >= 32 && channel <= 177) return 5000 + channel * 5;
+	return 0;
+}
+
 /* Frequency in MHz via SIOCGIWFREQ; returns 0 when not available */
 static int nm_get_wlan_freq_mhz(int sock, const char *iface)
 {
@@ -460,7 +476,10 @@ static int nm_get_wlan_freq_mhz(int sock, const char *iface)
 	int32_t m = wrq.u.freq.m;
 	int16_t e = wrq.u.freq.e;
 	if (m <= 0 || e < 0)
-		return 0; /* channel index or invalid */
+		return 0; /* invalid */
+	/* wireless extensions allow a channel number instead, marked by e == 0 and m < 1000 */
+	if (e == 0 && m < 1000)
+		return nm_channel_to_freq_mhz(m);
 	/* convert m * 10^e Hz → MHz */
 	while (e > 6) { m *= 10; e--; }
 	while (e < 6) { m /= 10; e++; }
