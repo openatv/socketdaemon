@@ -100,6 +100,13 @@
  * DHCP renewal on kernel 3.14 does not generate RTMGRP_IPV4_IFADDR).
  * select() is blocking, so this costs zero CPU while waiting. */
 #define POLL_INTERVAL_SEC 120
+
+/* Right after boot the interfaces are brought up one after another, which
+ * makes the kernel report short-lived carrier changes (admin up, no carrier
+ * yet / flapping PHY). For this long after the netmon thread started the
+ * LINK event line is not sent to the client; /var/run/netinfo and UPDATE are
+ * still written/sent so the client's state stays correct. */
+#define LINK_MUTE_SEC 60
 #define NETMON_BUF_SIZE   8192
 
 /*
@@ -1380,6 +1387,16 @@ static int nm_evt(char *evtbuf, int off, int max, const char *fmt, ...)
  * NETLINK_ROUTE parser → structured event lines
  * ============================================================ */
 
+static struct timespec g_netmonStart;
+static int g_linkSuppressed;	/* set when a LINK line was muted, so the loop still refreshes netinfo + UPDATE */
+
+static int nm_link_muted(void)
+{
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (now.tv_sec - g_netmonStart.tv_sec) < LINK_MUTE_SEC;
+}
+
 static int nm_handle_rtnetlink(int nls, char *evtbuf, int evtmax)
 {
 	char buf[8192];
@@ -1412,8 +1429,11 @@ static int nm_handle_rtnetlink(int nls, char *evtbuf, int evtmax)
 				int up = (ifi->ifi_flags & IFF_UP) != 0;
 				int running = (ifi->ifi_flags & IFF_RUNNING) != 0;
 				if (verbose) LOG("netmon: RTM_NEWLINK %s up=%d running=%d\n", ifname, up, running);
-				off = nm_evt(evtbuf, off, evtmax, "LINK,%s,%s,%s\n", ifname,
-					up ? "up" : "down", running ? "up" : "down");
+				if (nm_link_muted())
+					g_linkSuppressed = 1;
+				else
+					off = nm_evt(evtbuf, off, evtmax, "LINK,%s,%s,%s\n", ifname,
+						up ? "up" : "down", running ? "up" : "down");
 				if (up) {
 					int s = socket(AF_INET, SOCK_DGRAM, 0);
 					if (s >= 0) {
@@ -1538,6 +1558,7 @@ static void *monitor_thread(void *arg)
 	(void)arg;
 
 	if (verbose) LOG("netmon: thread started\n");
+	clock_gettime(CLOCK_MONOTONIC, &g_netmonStart);
 
 	/* NETLINK_ROUTE: link-state, IP-address and default-route events.
 	 * RTMGRP_IPV4_ROUTE is needed so a default-route add (e.g. DHCP adding
@@ -1634,13 +1655,17 @@ static void *monitor_thread(void *arg)
 		if (uev_sock >= 0 && FD_ISSET(uev_sock, &fds))
 			evtlen += nm_handle_uevent(uev_sock, evtbuf + evtlen, (int)sizeof(evtbuf) - evtlen);
 
-		if (evtlen > 0) {
+		if (evtlen > 0 || g_linkSuppressed) {
 			/* specific events: gather first so /var/run/netinfo is fresh.
 			 * Also push UPDATE so the client does a full resync — the
 			 * specific event handlers (LINK/IP/...) only touch a few
-			 * fields, not everything nm_gather_and_write() just refreshed. */
+			 * fields, not everything nm_gather_and_write() just refreshed.
+			 * A muted LINK line leaves evtlen at 0, but the state change
+			 * must still reach netinfo and the client. */
+			g_linkSuppressed = 0;
 			nm_gather_and_write(1);
-			net_cli = nm_send_to_client(net_cli, evtbuf, evtlen);
+			if (evtlen > 0)
+				net_cli = nm_send_to_client(net_cli, evtbuf, evtlen);
 			net_cli = nm_send_to_client(net_cli, "UPDATE\n", 7);
 		} else if (r == 0) {
 			/* fallback poll timeout */
